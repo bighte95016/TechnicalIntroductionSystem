@@ -1,0 +1,9 @@
+# 使用相對路徑指定基礎模型來源為本地的 GGUF 檔案(ollama轉換)
+#指令ollama create breeze-8b-gguf-q8 -f ./Modelfile
+
+#FROM ./model/Llama-Breeze2-8B-Instruct-text-only.Q4_K_M.gguf
+FROM ./model/Llama-Breeze2-8B-Instruct-text-only.Q8_0.gguf
+
+# (可選) 您可以根據需要取消註解並修改以下指令
+# TEMPLATE """[INST] {{ .Prompt }} [/INST]"""
+# SYSTEM """你是一位樂於助人的 AI 助理。""" 
