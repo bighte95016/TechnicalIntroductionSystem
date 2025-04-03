@@ -1,2 +1,8 @@
+langchain
+langchain-community
 ollama
-ctransformers[cuda]
+pypdf
+chromadb
+sentence-transformers
+langchain-openai
+python-dotenv

@@ -2,6 +2,7 @@ ollama:
 
 ycchen/breeze-7b-instruct-v1_0   (7B、4.3GB)
 qwen2.5:7b                       (7B、4.7GB)
+qwen2.5:3b                       (3B、1.9GB)
 gemma3:12b                      (12B、8.1GB)
 breeze-8b-gguf-q8                (8B、8.6GB)
 breeze-8b-gguf-q4                (8B、5.0GB)
