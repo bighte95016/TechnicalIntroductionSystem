@@ -6,3 +6,7 @@ chromadb
 sentence-transformers
 langchain-openai
 python-dotenv
+pyaudio
+numpy
+torch
+openai-whisper
