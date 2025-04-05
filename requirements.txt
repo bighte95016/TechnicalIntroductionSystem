@@ -10,3 +10,4 @@ pyaudio
 numpy
 torch
 openai-whisper
+pyttsx3
