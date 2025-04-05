@@ -49,7 +49,7 @@ RATE = 16000  # 採樣率
 CHUNK = 1024  # 每次讀取的音訊片段大小
 RECORD_SECONDS = 10  # 預設錄音時間，可由用戶中止
 WAVE_OUTPUT_FILENAME = "temp_recording.wav"  # 臨時錄音文件
-SPEECH_LANGUAGE = "zh"  # 默認為自動檢測語言，其他選項: "zh"為中文，"en"為英文
+SPEECH_LANGUAGE = "auto"  # 默認為自動檢測語言，其他選項: "zh"為中文，"en"為英文
 
 # --- Whisper 模型設定 ---
 WHISPER_MODEL_SIZE = "medium" # 可選: "tiny", "base", "small", "medium", "large"
@@ -177,30 +177,68 @@ def create_qa_chain(llm, vectorstore):
         retriever = vectorstore.as_retriever(search_kwargs={"k": k})
         print(f"檢索器將檢索 top {k} 個區塊。")
         
-        # 定義 Prompt 模板 (極簡版本)
-        template = """
+        # 定義雙語 Prompt 模板
+        template_zh = """
         你是一個介紹P-HUD(Panoramic HUD)的專家，請根據以下提供的上下文資訊，簡潔地回答問題。
         使用者的問題皆圍繞在P-HUD相關，
         如果你在提供的上下文中找不到答案，請明確說明你無法從文件中找到答案，不要嘗試編造或使用外部知識。
+        你必須使用繁體中文回答。
 
         上下文：
         {context}
 
         問題：{question}
 
-        答案（請根據上下文簡潔回答）：
+        繁體中文回答（請根據上下文簡潔回答）：
         """
-        QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
+
+        template_en = """
+        You are an expert on P-HUD (Panoramic HUD). Please answer the question concisely based on the context information provided below.
+        User questions are all related to P-HUD.
+        If you cannot find the answer in the provided context, please clearly state that you cannot find the answer in the document. Do not make up information or use external knowledge.
+        You must answer in English.
+
+        Context:
+        {context}
+
+        Question: {question}
+
+        English answer (please answer concisely based on the context):
+        """
         
+        # 創建兩種語言的提示模板
+        ZH_CHAIN_PROMPT = PromptTemplate.from_template(template_zh)
+        EN_CHAIN_PROMPT = PromptTemplate.from_template(template_en)
+        
+        # 默認使用中文提示
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=retriever,
             chain_type="stuff", # 使用 Stuff 方法
             return_source_documents=True,
-            chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
+            chain_type_kwargs={"prompt": ZH_CHAIN_PROMPT}
         )
-        print("QA 鏈建立成功。")
-        return qa_chain
+        
+        # 創建一個字典存儲不同語言的鏈
+        qa_chains = {
+            "zh": RetrievalQA.from_chain_type(
+                llm=llm,
+                retriever=retriever,
+                chain_type="stuff",
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": ZH_CHAIN_PROMPT}
+            ),
+            "en": RetrievalQA.from_chain_type(
+                llm=llm,
+                retriever=retriever,
+                chain_type="stuff",
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": EN_CHAIN_PROMPT}
+            )
+        }
+        
+        print("多語言 QA 鏈建立成功。")
+        return qa_chains
     except Exception as e:
         print(f"建立 QA 鏈時發生錯誤: {e}")
         return None
@@ -276,14 +314,14 @@ def load_whisper_model():
     return True
 
 def speech_to_text():
-    """使用本地Whisper將語音轉換為文字"""
+    """使用本地Whisper將語音轉換為文字，並返回偵測到的語言"""
     try:
         if not os.path.exists(WAVE_OUTPUT_FILENAME):
-            return "錄音失敗，找不到音頻文件。"
+            return "", "zh"  # 默認返回中文作為語言，空字串作為文字
         
         # 載入Whisper模型
         if not load_whisper_model():
-            return "無法載入語音識別模型，請檢查安裝。"
+            return "", "zh"
             
         print(f"正在使用本地Whisper模型轉換語音為文字 (語言: {'自動檢測' if SPEECH_LANGUAGE == 'auto' else SPEECH_LANGUAGE})...")
         
@@ -307,15 +345,15 @@ def speech_to_text():
             os.remove(WAVE_OUTPUT_FILENAME)
             
         text = result["text"].strip()
-        detected_language = result.get("language", "未知")
+        detected_language = result.get("language", "zh")  # 獲取偵測到的語言代碼，默認中文
         print(f"\n語音識別結果 (檢測到的語言: {detected_language})：「{text}」")
-        return text
+        return text, detected_language
     
     except Exception as e:
         print(f"語音轉文字時發生錯誤: {e}")
         if os.path.exists(WAVE_OUTPUT_FILENAME):
             os.remove(WAVE_OUTPUT_FILENAME)
-        return ""
+        return "", "zh"  # 錯誤時默認返回中文作為語言
 
 # --- 主要執行流程 (僅使用語音版本) ---
 if __name__ == "__main__":
@@ -355,8 +393,8 @@ if __name__ == "__main__":
         print("LLM 初始化失敗，程式終止。")
         sys.exit(1)
 
-    qa_chain = create_qa_chain(llm, vectorstore)
-    if not qa_chain:
+    qa_chains = create_qa_chain(llm, vectorstore)
+    if not qa_chains:
         print("QA 鏈建立失敗，程式終止。")
         sys.exit(1)
 
@@ -391,7 +429,7 @@ if __name__ == "__main__":
                 print(" 1. 按下 Enter 開始問問題")
                 print(" 2. 開始說話提問")
                 print(" 3. 再次按下 Enter 問完問題")
-                print(" 4. 系統將自動識別您的問題並回答")
+                print(" 4. 系統將自動識別您的問題並以相同語言回答")
                 print(" 特殊文字命令:")
                 print(" - 'exit': 結束程式")
                 print(" - 'help': 顯示此說明")
@@ -411,8 +449,8 @@ if __name__ == "__main__":
             stop_event.set()
             record_thread.join()
             
-            # 語音轉文字
-            question = speech_to_text()
+            # 語音轉文字，並獲取偵測到的語言
+            question, detected_lang = speech_to_text()
             if not question:
                 print("無法識別語音，請重試。")
                 continue
@@ -427,11 +465,25 @@ if __name__ == "__main__":
             if not question.strip():
                 continue
 
-            print(f"正在處理您的問題 (使用 {LLM_PROVIDER.upper()} LLM)...")
+            # 根據偵測到的語言選擇對應的 QA 鏈
+            # 將 Whisper 偵測的語言代碼映射到我們支持的語言
+            lang_map = {
+                "zh": "zh", "cn": "zh", "ja": "zh", "ko": "zh",  # 亞洲語言使用中文回答
+                "en": "en", "fr": "en", "de": "en", "es": "en",  # 西方語言使用英文回答
+            }
             
-            # <-- 直接調用 qa_chain.invoke
+            # 默認使用中文回答
+            answer_lang = lang_map.get(detected_lang, "zh")
+            
+            print(f"正在處理您的問題 (使用 {LLM_PROVIDER.upper()} LLM, 回答語言: {answer_lang})...")
+            
+            # 選擇對應語言的 QA 鏈
+            # 如果沒有對應語言的鏈，則退回到中文
+            qa_chain = qa_chains.get(answer_lang, qa_chains["zh"])
+            
+            # 調用 qa_chain.invoke
             result = qa_chain.invoke({"query": question})
-            # <-- 從結果中提取 'result'
+            # 從結果中提取 'result'
             answer = result.get('result', '抱歉，無法生成答案。').strip()
             source_docs = result.get('source_documents', []) # 獲取來源文檔 (可選)
 
