@@ -36,7 +36,7 @@ LLM_PROVIDER = "ollama" # 可選 'ollama' 或 'openai'
 
 # Ollama 設定(gemma3:12b、qwen2.5:7b、qwen2.5:3b)
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "qwen2.5:7b"                  
+OLLAMA_MODEL = "gemma3:12b"                  
 
 # OpenAI 設定
 OPENAI_MODEL_NAME = "gpt-4-turbo" # 或其他您想使用的 GPT 模型
@@ -101,7 +101,7 @@ def split_documents(documents):
     """將文件分割成較小的文字區塊"""
     print("正在分割文件...")
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,  # 減小文字區塊大小以提高處理速度
+        chunk_size=300,  # 減小文字區塊大小以提高處理速度
         chunk_overlap=100, # 減小重疊以提高處理速度
         length_function=len,
         add_start_index=True, # 添加起始索引元數據
@@ -187,11 +187,11 @@ def create_qa_chain(llm, vectorstore):
         retriever = vectorstore.as_retriever(search_kwargs={"k": k})
         print(f"檢索器將檢索 top {k} 個區塊。")
         
-        # 定義雙語 Prompt 模板
+        # 定義雙語 Prompt 模板 Panoramic HUD
         template_zh = """
-        你是一個介紹P-HUD(Panoramic HUD)的專家，請根據以下提供的上下文資訊，簡潔地回答問題。
+        你是一個介紹全景抬頭式顯示器(P-HUD)的專家，請根據以下提供的上下文資訊，簡潔地回答問題。
         使用者的問題皆圍繞在P-HUD相關，
-        如果你在提供的上下文中找不到答案，請明確說明你無法從文件中找到答案，不要嘗試編造或使用外部知識。
+        如果你在提供的上下文中找不到答案，不要嘗試編造或使用外部知識。
         你必須使用繁體中文回答。
 
         上下文：
@@ -246,9 +246,9 @@ def create_qa_chain(llm, vectorstore):
 
 # --- 語音處理功能 ---
 def record_audio(stop_event):
-    """錄製音頻並保存為臨時文件"""
+    """接收音頻並保存為臨時文件"""
     audio = pyaudio.PyAudio()
-    print("正在準備錄音...")
+    print("正在準備接收問題...")
     
     # 打開音頻流
     stream = audio.open(format=AUDIO_FORMAT,
@@ -290,7 +290,7 @@ def record_audio(stop_event):
         wf.writeframes(b''.join(frames))
         wf.close()
         
-        print(f"錄音已保存為 {WAVE_OUTPUT_FILENAME}")
+        print(f"問題已保存為 {WAVE_OUTPUT_FILENAME}")
 
 def load_whisper_model():
     """載入Whisper模型"""
@@ -488,7 +488,7 @@ if __name__ == "__main__":
     while True:
         try:
             # 顯示提示並等待用戶輸入
-            command = input("\n按下 Enter 開始錄音，或輸入命令 > ")
+            command = input("\n按下 Enter 開始問問題，或輸入命令 > ")
             
             # 處理文字命令 (保留少數文字命令以方便操作)
             if command.strip().lower() == 'exit':
