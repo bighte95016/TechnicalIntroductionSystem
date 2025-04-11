@@ -57,7 +57,7 @@ WAVE_OUTPUT_FILENAME = "temp_recording.wav"  # 臨時錄音文件
 SPEECH_LANGUAGE = "auto"  # 默認為自動檢測語言，其他選項: "zh"為中文，"en"為英文
 
 # --- TTS設定 ---
-TTS_RATE = 200  # 語速 (words per minute)
+TTS_RATE = 175  # 語速 (words per minute)
 TTS_VOLUME = 0.8  # 音量 (0.0 到 1.0)
 
 # --- Whisper 模型設定 ---
@@ -511,15 +511,17 @@ def main():
         
         # --- 步驟 5: 建立QA鏈 ---
         print("正在建立 QA 鏈...")
-        k=2
+        k=3
         retriever = vectorstore.as_retriever(search_kwargs={"k": k})
         print(f"檢索器將檢索 top {k} 個區塊。")
         
         # 定義雙語 Prompt 模板 Panoramic HUD
+        #回答：「這個問題不在我的回答範疇，請詢問一旁的專家」
         template_zh = """
-        你是一個介紹全景抬頭式顯示器(P-HUD)的專家，請根據以下提供的技術資訊，簡潔地回答問題。
+        你是一個介紹全景抬頭式顯示器(P-HUD)的工研院專家，
+        請根據以下提供的「技術資訊」，簡潔地回答問題。
         使用者的問題皆圍繞在P-HUD相關，
-        如果你在提供的技術資訊中找不到答案，不要嘗試編造或使用外部知識。
+        如果你在提供的技術資訊中找不到答案或相關性不高，回答：「這個問題不在我的回答範疇，請詢問一旁的專家」
         你必須使用繁體中文回答。
 
         技術資訊：
@@ -527,13 +529,15 @@ def main():
 
         問題：{question}
 
-        繁體中文回答（請根據技術資訊簡潔回答）：
+        繁體中文回答（請根據技術資訊簡潔回答），並將P-HUD皆改成P-H-U-D：
         """
 
         template_en = """
-        You are an expert on P-HUD (Panoramic HUD). Please answer the question concisely based on the Technical information provided below.
-        User questions are all related to P-HUD.
-        If you cannot find the answer in the provided Technical information, please clearly state that you cannot find the answer in the Technical information. Do not make up information or use external knowledge.
+        You are an expert from the ITRI specializing in introducing Panoramic Head-Up Displays(P-HUD). 
+        Based on the “technical information” provided below, please answer questions succinctly. 
+        All user questions revolve around topics related to P-HUD. 
+        If you cannot find the answer or relevant information in the provided technical details, 
+        please respond with: "This question is outside the scope of my expertise. Please consult the expert next to you."
         You must answer in English.
 
         Technical information:
@@ -541,7 +545,7 @@ def main():
 
         Question: {question}
 
-        English answer (please answer concisely based on the Technical information):
+        English answer (please answer concisely based on the Technical information), and replace P-HUD with P-H-U-D:
         """
         
         # 創建兩種語言的提示模板
@@ -643,7 +647,7 @@ def main():
                 print("啟動背景線程播放提示音...")
                 prompt_thread = threading.Thread(
                     target=text_to_speech,
-                    args=("請稍等一下，我思考一下這個問題", "zh"),
+                    args=("問得好，請稍等一下，我思考一下這個問題", "zh"),
                     daemon=True # 設置為守護線程，這樣即使它沒播完主程序也能退出
                 )
                 prompt_thread.start()
