@@ -12,3 +12,6 @@ torch
 openai-whisper
 pyttsx3
 SpeechRecognition
+gTTS
+pydub
+simpleaudio
