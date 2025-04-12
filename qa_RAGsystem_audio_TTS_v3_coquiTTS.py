@@ -82,7 +82,7 @@ TTS_ENABLE_CACHE = True  # 是否啟用音頻緩存
 TTS_SAMPLE_RATE = 22050  # 音頻采樣率 (24000 是 XTTS 的原始值，22050 稍低但仍保持良好音質)
 
 # 固定使用的說話人（可以根據偏好修改）
-FIXED_ZH_SPEAKER = "Daisy Studious"  # 中文固定說話人 
+FIXED_ZH_SPEAKER = "Tammie Ema"  # 中文固定說話人 
 FIXED_EN_SPEAKER = "Daisy Studious"  # 英文固定說話人
 AVAILABLE_SPEAKERS = []  # 全局變量，存儲可用的說話人列表，保留用於驗證固定說話人是否可用
 
@@ -566,7 +566,7 @@ def map_whisper_language_to_supported(detected_lang):
     """將 Whisper 檢測的語言代碼映射到我們支持的語言"""
     lang_map = {
         "zh": "zh", "cn": "zh", "ja": "zh", "ko": "zh",  # 亞洲語言使用中文回答
-        "en": "en", "fr": "en", "de": "en", "es": "en",  # 西方語言使用英文回答
+        "en": "en", "fr": "en", "de": "en", "es": "en", "my": "en",  # 西方語言使用英文回答
     }
     # 默認使用中文回答
     return lang_map.get(detected_lang, "zh")
@@ -810,7 +810,7 @@ def main():
                     with prompt_lock:
                         try:
                             # 使用簡單的提示音
-                            prompt_text = "問得非常好，請稍等一下，我思考一下這個問題"
+                            prompt_text = "問得非常好，請稍等一下，我思考一下這個問題喔。"
                             tts_kwargs = {
                                 "text": prompt_text,
                                 "language": "zh-cn",
@@ -862,15 +862,15 @@ def main():
                 # 獲取處理結果
                 status, result = answer_queue.get()
                 
-                # 等待提示音播放完成（如果尚未完成）
+                # 如果提示音仍在播放，試圖優雅地停止它
                 if prompt_thread.is_alive():
-                    print("等待提示音播放完成...")
-                    prompt_thread.join()
+                    print("提示音仍在播放，但我們將繼續處理回答...")
+                    # 注意：我們不再等待提示音完成，而是直接繼續
                 
                 if status == "success":
                     answer = result
                     
-                    # 播放回答
+                    # 立即播放回答，不等待提示音
                     print(f"啟動線程播放回答 {lang} 語音 (使用 Coqui TTS)... ")
                     answer_thread = threading.Thread(
                         target=text_to_speech,
