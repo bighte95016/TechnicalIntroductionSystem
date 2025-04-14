@@ -725,13 +725,13 @@ def generate_and_save_greeting_audio():
         traceback.print_exc()
         return False
 
-# 添加直接播放WAV文件的函數
-def play_wav_file(wav_file_path):
-    """直接播放WAV文件"""
+# 修改play_wav_file函數，使其在非阻塞模式下播放
+def play_wav_file(wav_file_path, block=True):
+    """直接播放WAV文件，可選是否阻塞等待播放完成"""
     try:
         if not os.path.exists(wav_file_path):
             print(f"錯誤：找不到音頻文件 {wav_file_path}")
-            return False
+            return False, None
             
         print(f"正在播放音頻文件: {wav_file_path}")
         
@@ -753,14 +753,22 @@ def play_wav_file(wav_file_path):
                 bytes_per_sample=sample_width,
                 sample_rate=sample_rate
             )
-            play_obj.wait_done()
-            print("音頻播放完成")
-            return True
+            
+            # 如果需要阻塞，則等待播放完成
+            if block:
+                play_obj.wait_done()
+                print("音頻播放完成")
+                return True, None
+            else:
+                # 非阻塞模式，返回播放對象以便稍後檢查狀態
+                print("音頻開始播放（非阻塞模式）")
+                return True, play_obj
+                
     except Exception as e:
         print(f"播放音頻文件時發生錯誤: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return False, None
 
 def main():
     """主程序入口"""
@@ -925,12 +933,12 @@ def main():
                     print("===================================")
                     continue
                     
-                # 播放問候音頻（替代開始錄音的步驟）
-                print("播放問候音頻...")
-                play_wav_file(greeting_audio_path)
+                # 改為在非阻塞模式下播放問候音頻，同時開始錄音
+                print("播放問候音頻同時開始接收語音輸入...")
+                success, play_obj = play_wav_file(greeting_audio_path, block=False)
                 
-                # 開始錄音
-                print(f"{BOLD}開始錄音...{RESET} (再次按下 Enter 停止)")
+                # 立即開始錄音，不等待音頻播放完成
+                print(f"{BOLD}開始錄音...{RESET} (按下 Enter 停止)")
                 # 創建停止事件
                 stop_event = threading.Event()
                 
@@ -942,6 +950,11 @@ def main():
                 input("按下Enter鍵，結束問問題...")
                 stop_event.set()
                 record_thread.join()
+                
+                # 檢查音頻是否仍在播放，如果是則停止它
+                if play_obj and play_obj.is_playing():
+                    print("問候音頻尚未播放完成，但用戶已結束提問")
+                    # 注意：simpleaudio沒有直接的stop方法，但我們可以讓它繼續播放，不會影響程序流程
                 
                 # 語音轉文字，並獲取偵測到的語言
                 question, detected_lang = speech_to_text()
