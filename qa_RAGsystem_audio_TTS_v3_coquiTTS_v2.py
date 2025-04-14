@@ -835,7 +835,7 @@ def main():
         #回答：「這個問題不在我的回答範疇，請詢問一旁的專家」
         template_zh = """
         你是一個介紹全景抬頭式顯示器的工研院專家，
-        請根據以下提供的「技術資訊」，簡潔地回答問題。
+        請根據以下提供的「技術資訊」，簡潔地回答問題(小於25字)。
         使用者的問題皆圍繞在P-HUD相關，
         如果你在提供的技術資訊中找不到答案或相關性不高，回答：「這個問題不在我的回答範疇，請詢問一旁的專家」
         你必須使用繁體中文回答。
@@ -850,7 +850,7 @@ def main():
 
         template_en = """
         You are an expert from the ITRI specializing in introducing Panoramic Head-Up Displays(P-HUD). 
-        Based on the "technical information" provided below, please answer questions succinctly. 
+        Based on the "technical information" provided below, please answer questions succinctly.(less than 25 words) 
         All user questions revolve around topics related to P-HUD. 
         If you cannot find the answer or relevant information in the provided technical details, 
         please respond with: "This question is outside the scope of my expertise. Please consult the expert next to you."
@@ -861,7 +861,7 @@ def main():
 
         Question: {question}
 
-        English answer (Please answer as concisely as possible based on the technical information, within 25 words.), and replace P-HUD with P-H-U-D:
+        English answer (Please answer as concisely as possible based on the technical information, less than 25 words.), and replace P-HUD with P-H-U-D:
         """
         
         # 創建兩種語言的提示模板
@@ -995,12 +995,26 @@ def main():
                     prompt_lock = threading.Lock()
                     with prompt_lock:
                         try:
-                            # 使用簡單的提示音
-                            prompt_text = "感謝您的提問，我思考一下請稍候!"
+                            # 根據檢測到的語言選擇提示音文本
+                            if lang == "en":
+                                # 英文提示音
+                                prompt_text = "Thank you for your question. Let me think about it for a moment."
+                                prompt_lang = "en"
+                            else:
+                                # 中文提示音
+                                prompt_text = "感謝您的提問，我思考一下請稍候!"
+                                prompt_lang = "zh-cn"
+                                
+                            # 選擇相應語言的說話人
+                            if prompt_lang == "zh-cn":
+                                selected_speaker = FIXED_ZH_SPEAKER if FIXED_ZH_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
+                            else:
+                                selected_speaker = FIXED_EN_SPEAKER if FIXED_EN_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
+                                
                             tts_kwargs = {
                                 "text": prompt_text,
-                                "language": "zh-cn",
-                                "speaker": FIXED_ZH_SPEAKER if FIXED_ZH_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
+                                "language": prompt_lang,
+                                "speaker": selected_speaker
                             }
                             
                             if not tts_kwargs["speaker"]:
@@ -1028,6 +1042,8 @@ def main():
                                 play_obj.wait_done()
                         except Exception as e:
                             print(f"播放提示音時發生錯誤: {e}")
+                            import traceback
+                            traceback.print_exc()
 
                 # 啟動LLM處理線程
                 print("啟動LLM處理線程...")
