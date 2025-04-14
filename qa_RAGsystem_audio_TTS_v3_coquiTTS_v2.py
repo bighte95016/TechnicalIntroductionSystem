@@ -29,6 +29,7 @@ import simpleaudio as sa           # For playing audio data
 import tempfile
 import speech_recognition as sr
 import queue
+from pathlib import Path
 
 # --- 在所有 import 之後，第一次訪問環境變數之前調用 load_dotenv --- #
 load_dotenv()
@@ -83,12 +84,16 @@ TTS_ENABLE_CACHE = True  # 是否啟用音頻緩存
 TTS_SAMPLE_RATE = 22050  # 音頻采樣率 (24000 是 XTTS 的原始值，22050 稍低但仍保持良好音質)
 
 # 固定使用的說話人（可以根據偏好修改）
-FIXED_ZH_SPEAKER = "Tammie Ema"  # 中文固定說話人 
-FIXED_EN_SPEAKER = "Daisy Studious"  # 英文固定說話人
+FIXED_ZH_SPEAKER = "Tammie Ema"  # 中文固定說話人     Tammie Ema
+FIXED_EN_SPEAKER = "Tammie Ema"  # 英文固定說話人 Daisy Studious
 AVAILABLE_SPEAKERS = []  # 全局變量，存儲可用的說話人列表，保留用於驗證固定說話人是否可用
 
 # 音頻緩存字典 {(text, language, speaker): audio_data}
 TTS_CACHE = {}  # 音頻緩存
+
+# 終端文字樣式
+BOLD = "\033[1m"
+RESET = "\033[0m"
 
 # --- TTS引擎初始化 ---
 tts_lock = threading.Lock()  # 保留鎖
@@ -602,14 +607,173 @@ def process_user_query(question, qa_chain, language):
     
     return answer
 
+# 添加用於保存和播放問候音頻的函數
+def generate_and_save_greeting_audio():
+    """生成並保存問候音頻，然後播放"""
+    global coqui_tts_model, AVAILABLE_SPEAKERS, TTS_CACHE
+    
+    if not coqui_tts_model:
+        print("錯誤：Coqui TTS 模型未初始化，無法生成問候音頻。")
+        return False
+    
+    # 準備保存目錄
+    audio_dir = Path("audio_files")
+    if not audio_dir.exists():
+        audio_dir.mkdir(parents=True)
+    
+    # 問候語音文件路徑
+    greeting_path = audio_dir / "greeting_hello.wav"
+    
+    # 檢查問候語音文件是否已存在
+    if greeting_path.exists():
+        print(f"問候語音文件已存在於 {greeting_path}，直接播放...")
+        # 使用wave模塊讀取現有的音頻文件
+        try:
+            with wave.open(str(greeting_path), 'rb') as wf:
+                # 獲取音頻參數
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                sample_rate = wf.getframerate()
+                frames = wf.readframes(wf.getnframes())
+                
+                # 將二進制音頻數據轉換為整數數組
+                audio_int16 = np.frombuffer(frames, dtype=np.int16)
+                
+                # 播放音頻
+                play_obj = sa.play_buffer(
+                    audio_int16,
+                    num_channels=channels,
+                    bytes_per_sample=sample_width,
+                    sample_rate=sample_rate
+                )
+                play_obj.wait_done()
+                return True
+        except Exception as e:
+            print(f"播放現有問候語音文件時發生錯誤: {e}")
+            # 如果播放失敗，則重新生成
+    
+    print("生成問候語音「您好！」...")
+    
+    # 根據系統設置的中文說話人生成音頻
+    selected_speaker = FIXED_ZH_SPEAKER if FIXED_ZH_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
+    
+    if not selected_speaker:
+        print("錯誤: 找不到可用的說話人。")
+        return False
+    
+    # 生成問候語音
+    try:
+        tts_kwargs = {
+            "text": "!Hello！",
+            "language": "zh-cn",
+            "speaker": selected_speaker
+        }
+        
+        wav = coqui_tts_model.tts(**tts_kwargs)
+        
+        # 檢查 wav 的類型，並確保它是 numpy 數組
+        print(f"檢查音頻數據類型: {type(wav)}")
+        if isinstance(wav, list):
+            # 如果是列表，首先檢查第一個元素是否就是我們需要的音頻數據
+            if len(wav) == 1 and isinstance(wav[0], np.ndarray):
+                wav = wav[0]
+            else:
+                # 嘗試將列表轉換為 numpy 數組
+                try:
+                    wav = np.array(wav, dtype=np.float32)
+                except:
+                    print(f"警告：無法將列表轉換為 numpy 數組，列表結構：{[type(x) for x in wav]}")
+                    if len(wav) > 0:
+                        # 使用第一個元素如果可能
+                        wav = np.array(wav[0], dtype=np.float32) if isinstance(wav[0], (list, np.ndarray)) else np.array(wav[0])
+        
+        # 確保 wav 是 numpy 數組
+        if not isinstance(wav, np.ndarray):
+            print(f"錯誤：音頻數據不是 numpy 數組，而是 {type(wav)}")
+            # 進一步檢查和處理
+            if hasattr(wav, '__array__'):  # 檢查是否可以轉換為 numpy 數組
+                wav = np.array(wav)
+            else:
+                print("無法處理的音頻數據類型，嘗試另一種方法生成問候語音")
+                return False
+        
+        # 將浮點音頻轉換為int16
+        wav_int16 = (wav * 32767).astype(np.int16)
+        
+        # 使用wave模塊保存為WAV文件
+        with wave.open(str(greeting_path), 'wb') as wf:
+            wf.setnchannels(1)  # 單聲道
+            wf.setsampwidth(2)  # 2字節 (16位)
+            wf.setframerate(TTS_SAMPLE_RATE)
+            wf.writeframes(wav_int16.tobytes())
+        
+        print(f"成功保存問候語音到 {greeting_path}")
+        
+        # 播放剛剛生成的音頻
+        play_obj = sa.play_buffer(
+            wav_int16,
+            num_channels=1,
+            bytes_per_sample=2,
+            sample_rate=TTS_SAMPLE_RATE
+        )
+        play_obj.wait_done()
+        return True
+    
+    except Exception as e:
+        print(f"生成或保存問候語音時發生錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# 添加直接播放WAV文件的函數
+def play_wav_file(wav_file_path):
+    """直接播放WAV文件"""
+    try:
+        if not os.path.exists(wav_file_path):
+            print(f"錯誤：找不到音頻文件 {wav_file_path}")
+            return False
+            
+        print(f"正在播放音頻文件: {wav_file_path}")
+        
+        # 使用wave模塊讀取音頻文件
+        with wave.open(wav_file_path, 'rb') as wf:
+            # 獲取音頻參數
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            sample_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+            
+            # 將二進制音頻數據轉換為整數數組
+            audio_int16 = np.frombuffer(frames, dtype=np.int16)
+            
+            # 播放音頻
+            play_obj = sa.play_buffer(
+                audio_int16,
+                num_channels=channels,
+                bytes_per_sample=sample_width,
+                sample_rate=sample_rate
+            )
+            play_obj.wait_done()
+            print("音頻播放完成")
+            return True
+    except Exception as e:
+        print(f"播放音頻文件時發生錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main():
     """主程序入口"""
-    # 初始化模型和文檔處理器
     global qa_chains
     qa_chains = {}
     
+    # 記錄是否已播放過問候音頻
+    greeting_played = False
+    
+    # 初始化模型和文檔處理器
     print("歡迎使用語音問答系統！")
-    print("正在載入模型和處理文檔...")
+    print("初始化中... 請稍候")
+    print("正在初始化文件載入器和模型，這可能需要一些時間...")
     
     try:
         # 初始化 Coqui TTS 引擎
@@ -733,7 +897,10 @@ def main():
         print(f" 當前語音識別設定: 自動檢測語言")
         print(" 按下 Enter 開始問問題，再次按下 Enter 結束問問題")
         print("===================================")
-
+        
+        # 指定問候音頻文件路徑
+        greeting_audio_path = "./audio_files/please_speak.wav"
+        
         while True:
             try:
                 # 顯示提示並等待用戶輸入
@@ -758,7 +925,12 @@ def main():
                     print("===================================")
                     continue
                     
-                # 如果不是特殊命令，則開始語音輸入 (無論用戶輸入什麼或只是按Enter)
+                # 播放問候音頻（替代開始錄音的步驟）
+                print("播放問候音頻...")
+                play_wav_file(greeting_audio_path)
+                
+                # 開始錄音
+                print(f"{BOLD}開始錄音...{RESET} (再次按下 Enter 停止)")
                 # 創建停止事件
                 stop_event = threading.Event()
                 
@@ -776,7 +948,7 @@ def main():
                 if not question:
                     print("無法識別語音，請重試。")
                     continue
-                    
+                
                 # 處理識別出的文字，檢查是否為退出命令
                 if question.lower().strip() in ["退出", "結束", "exit", "quit"]:
                     print("語音指令: 退出程式")
@@ -811,7 +983,7 @@ def main():
                     with prompt_lock:
                         try:
                             # 使用簡單的提示音
-                            prompt_text = "問得非常好，請稍等一下，我思考一下這個問題喔。"
+                            prompt_text = "感謝您的提問，我思考一下請稍候!"
                             tts_kwargs = {
                                 "text": prompt_text,
                                 "language": "zh-cn",
@@ -903,10 +1075,10 @@ def main():
                     error_thread.start()
                     error_thread.join()
                     print("錯誤提示播放完成。")
-
+                
             except KeyboardInterrupt: # 允許 Ctrl+C 中斷
-                 print("\n偵測到中斷指令，正在結束程式...")
-                 break
+                print("\n偵測到中斷指令，正在結束程式...")
+                break
             except Exception as e:
                 print(f"處理問題時發生未預期的錯誤: {e}")
                 print("請檢查輸入、LLM 狀態或程式邏輯。")
@@ -914,7 +1086,7 @@ def main():
         # 清理臨時文件
         if os.path.exists(WAVE_OUTPUT_FILENAME):
             os.remove(WAVE_OUTPUT_FILENAME)
-            
+
         print("--- 全語音問答系統已關閉 ---")
 
     except Exception as e:

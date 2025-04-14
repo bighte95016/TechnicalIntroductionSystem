@@ -548,7 +548,7 @@ def main():
         
         # --- 步驟 5: 建立QA鏈 ---
         print("正在建立 QA 鏈...")
-        k=2
+        k=3
         retriever = vectorstore.as_retriever(search_kwargs={"k": k})
         print(f"檢索器將檢索 top {k} 個區塊。")
         
