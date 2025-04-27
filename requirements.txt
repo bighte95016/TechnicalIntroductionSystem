@@ -15,3 +15,4 @@ SpeechRecognition
 gTTS
 pydub
 simpleaudio
+pypdf2
