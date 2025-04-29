@@ -41,61 +41,59 @@ if sys.version_info < (3, 8):
 
 # --- 新增: 按段落處理PDF文件 ---
 def load_pdf_by_paragraph(pdf_path: str):
-    """讀 PDF → 清理軟換行 → 依雙換行切段，QA 格式自動合併"""
+    """讀 PDF → 清理軟換行 → 以行首 Qxx 切塊"""
     print(f"[load] {pdf_path}")
     try:
-        # ① 直接一次讀完整本（❗重點：split_pages=False）
-        loader = PyPDFLoader(pdf_path)
-        documents = loader.load()
+        # 使用 PyPDF2 直接讀取完整 PDF
+        from PyPDF2 import PdfReader
+        reader = PdfReader(pdf_path)
+        full_text = "\n".join(p.extract_text() or "" for p in reader.pages)
         
-        # 將所有頁面內容合併
-        full_text = "\n".join([doc.page_content for doc in documents])
+        # 獲取基本元數據
+        base_md = {
+            "source": pdf_path,
+            "file_name": os.path.basename(pdf_path)
+        }
+
+        # 換行正規化
+        # a) 把所有非常規換行(LS‧PS‧CR‧VT‧FF) → \n
+        full_text = full_text.translate(
+            dict.fromkeys(map(ord, "\r\u2028\u2029\v\f"), "\n")
+        )
+        # b) 只把「真正單行軟換行」換成空格
+        full_text = re.sub(r"(?<!\n)\n(?!\s*\n)", " ", full_text)
+        # c) 把 3 行以上空白壓成 2 行
+        full_text = re.sub(r"\n{3,}", "\n\n", full_text)
+        # d) 開頭補 \n，方便偵測第一題
+        if not full_text.startswith("\n"):
+            full_text = "\n" + full_text
+
+        # 以行首 Qxx 切塊
+        q_head = re.compile(r"\n\s*Q\s*\d+\s*[：:]", re.IGNORECASE)
+        starts = [m.start()+1 for m in q_head.finditer(full_text)] + [len(full_text)]
         
-        # 獲取基本元數據（從第一頁）
-        base_md = {}
-        if documents:
-            for key, value in documents[0].metadata.items():
-                if key != 'page':  # 排除頁碼信息
-                    base_md[key] = value
-        
-        # 添加文件名到元數據
-        base_md.update({"source": pdf_path,
-                        "file_name": os.path.basename(pdf_path)})
-
-        # ② 正規化換行
-        full_text = full_text.replace("\r\n", "\n").replace("\r", "\n")
-        full_text = re.sub(r"(?<!\n)\n(?!\n)", " ", full_text)   # 軟換行→空格
-        full_text = re.sub(r"\n{3,}", "\n\n", full_text)         # 3+ 行→2 行
-
-        # ③ 依空白行切段
-        paras = [p.strip() for p in full_text.split("\n\n") if p.strip()]
-
-        # ④ 判斷是否為 QA 文件（抓 Axx：行）
-        a_cnt = sum(1 for p in paras if re.match(r"^A\d+[:：]", p))
-        is_qa = a_cnt > 3
-        docs = []
-
-        if is_qa:
-            print("  ➜ 偵測到 QA 格式，合併 Q+A")
-            buf = []
-            for p in paras:
-                buf.append(p)
-                if re.match(r"^A\d+[:：]", p):       # 遇到回答就封包
-                    docs.append("\n".join(buf))
-                    buf.clear()
-            if buf:  docs.append("\n".join(buf))     # 殘餘處理
-            docs = [Document(page_content=qa,
-                             metadata={**base_md,
-                                       "paragraph_index": i,
-                                       "type": "qa_pair"})
-                    for i, qa in enumerate(docs)]
+        # 如果找到問題標記
+        if starts and len(starts) > 1:
+            print(f"  ➜ 偵測到 Q 格式，以問題標記切分")
+            chunks = [
+                full_text[starts[i]:starts[i+1]].strip()
+                for i in range(len(starts)-1)
+            ]
+            print(f"  ➜ 找到 {len(chunks)} 個 QA 組合")
+            
+            # 建立 Document 物件
+            docs = [Document(
+                page_content=chunk,
+                metadata={**base_md, "paragraph_index": i, "type": "qa_pair"}
+            ) for i, chunk in enumerate(chunks)]
         else:
-            print("  ➜ 一般段落文件")
-            docs = [Document(page_content=p,
-                             metadata={**base_md,
-                                       "paragraph_index": i,
-                                       "type": "paragraph"})
-                    for i, p in enumerate(paras)]
+            # 退回到依雙換行切段（一般文件）
+            print("  ➜ 未偵測到問題標記，依雙換行切分")
+            paras = [p.strip() for p in full_text.split("\n\n") if p.strip()]
+            docs = [Document(
+                page_content=p,
+                metadata={**base_md, "paragraph_index": i, "type": "paragraph"}
+            ) for i, p in enumerate(paras)]
 
         print(f"  ✓ 共產生 {len(docs)} 個 chunk")
         return docs

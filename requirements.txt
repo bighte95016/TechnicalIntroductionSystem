@@ -16,3 +16,4 @@ gTTS
 pydub
 simpleaudio
 pypdf2
+PdfReader
