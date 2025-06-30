@@ -7,7 +7,8 @@ numpy>=1.21.0
 # 語音輸出功能依賴 (CoquiTTS)
 TTS>=0.22.0
 pydub>=0.25.1
-simpleaudio>=1.0.4
+sounddevice>=0.4.4
+soundfile>=0.10.0
 
 # 中文分詞 (用於BM25檢索)
 jieba>=0.42.1
@@ -15,7 +16,6 @@ jieba>=0.42.1
 # 其他可選依賴
 scipy>=1.7.0  # TTS可能需要
 librosa>=0.8.0  # 音頻處理
-soundfile>=0.10.0  # 音頻文件讀寫
 
 # 音頻處理相關依賴
 wave
