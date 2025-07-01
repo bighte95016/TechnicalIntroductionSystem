@@ -1,32 +1,32 @@
-# 語音輸入功能依賴
+# 語音輸入功能所需的額外依賴項
+# 基於原有的RAG系統，新增以下語音相關依賴
+
+# 語音錄製和處理
 pyaudio>=0.2.11
-openai-whisper>=20231117
+numpy>=1.21.0
+
+# Whisper語音識別
+openai-whisper>=20230918
 torch>=1.9.0
-numpy>=1.21.0
+torchaudio>=0.9.0
 
-# 語音輸出功能依賴 (CoquiTTS)
-TTS>=0.22.0
-pydub>=0.25.1
-sounddevice>=0.4.4
-soundfile>=0.10.0
-
-# 中文分詞 (用於BM25檢索)
+# 原有RAG系統依賴項
+langchain>=0.0.340
+langchain-community>=0.0.1
+langchain-ollama>=0.1.0
+langchain-openai>=0.0.1
+chromadb>=0.4.0
+pypdf2>=3.0.0
+python-dotenv>=1.0.0
 jieba>=0.42.1
+rank-bm25>=0.2.2
 
-# 其他可選依賴
-scipy>=1.7.0  # TTS可能需要
-librosa>=0.8.0  # 音頻處理
-
-# 音頻處理相關依賴
-wave
-numpy>=1.21.0
-
-# 原有的 RAG 系統依賴
-langchain
-langchain-community
-langchain-ollama
-langchain-openai
-chromadb
-python-dotenv
-rank-bm25
-pickle-mixin 
+# 安裝說明：
+# pip install -r requirements_voice.txt
+#
+# 注意事項：
+# 1. pyaudio在某些系統上可能需要額外的系統級依賴項
+# 2. Ubuntu/Debian: sudo apt-get install portaudio19-dev
+# 3. macOS: brew install portaudio  
+# 4. Windows: 通常可以直接pip安裝
+# 5. 如果沒有CUDA，torch會自動使用CPU版本 

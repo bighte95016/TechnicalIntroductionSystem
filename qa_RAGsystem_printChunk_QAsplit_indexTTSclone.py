@@ -1,50 +1,11 @@
 import os
-# 必須在所有其他導入之前設置這些環境變數 - PyInstaller 兼容性修復
-os.environ["TYPEGUARD_DISABLE_RUNTIME_TYPE_CHECKING"] = "1"
-os.environ["PYTHONHASHSEED"] = "0"
-os.environ["PYTORCH_DISABLE_GRAD_CHECK"] = "1"
-
-# 解決PyInstaller打包時inspect.getsource()的問題
 import sys
-if getattr(sys, 'frozen', False):
-    # 如果是打包的可執行文件，應用所有必要的修復
-    import inspect
-    
-    # Mock inspect functions that cause problems
-    def mock_getsource(obj):
-        return "# Source not available in frozen executable"
-    
-    def mock_getsourcelines(obj):
-        return (["# Source not available in frozen executable"], 0)
-    
-    def mock_findsource(obj):
-        return (["# Source not available in frozen executable"], 0)
-    
-    # Apply mocks
-    inspect.getsource = mock_getsource
-    inspect.getsourcelines = mock_getsourcelines
-    inspect.findsource = mock_findsource
-    
-    # 額外的 inflect 套件兼容性修復
-    try:
-        import inflect
-        # 如果 inflect 模組存在，嘗試修復其 engine 函數
-        original_engine = inflect.engine
-        def patched_engine(*args, **kwargs):
-            try:
-                return original_engine(*args, **kwargs)
-            except (OSError, IOError):
-                # 如果無法獲取源碼，返回一個基本的 engine 實例
-                return inflect.engine()
-        inflect.engine = patched_engine
-    except ImportError:
-        pass
-
-import os
-import sys
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaLLM
+from langchain_community.chat_models import ChatOllama
 from langchain_openai import ChatOpenAI # 新增 OpenAI LLM
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -57,22 +18,22 @@ from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 import pickle
 import jieba  # 中文分詞
-import threading  # 新增：線程處理
-import time  # 新增：時間處理
 
-# 新增：語音處理相關導入
-import pyaudio  # 音頻錄製
-import wave  # 音頻文件處理
-import whisper  # Whisper 語音識別
-import torch  # PyTorch
-import numpy as np  # 數值計算
-import queue  # 線程間通信
+# 新增：語音輸入相關imports
+import pyaudio
+import wave
+import threading
+import whisper # 本地版本 Whisper
+import torch # PyTorch
+import numpy as np
+import time  # 添加time模組用於計時
+import queue
 
-# 新增：TTS語音合成相關導入
-from TTS.api import TTS    # Coqui TTS
-import simpleaudio as sa           # For playing audio data
-import tempfile
-from pathlib import Path
+# 新增：TTS語音輸出相關imports
+import pathlib
+sys.path.append(str(pathlib.Path(__file__).parent / "index_tts"))
+from index_tts.indextts.infer import IndexTTS
+import sounddevice as sd
 
 # --- 在所有 import 之後，第一次訪問環境變數之前調用 load_dotenv --- #
 load_dotenv()
@@ -95,67 +56,294 @@ OPENAI_MODEL_NAME = "gpt-4-turbo" # 或其他您想使用的 GPT 模型
 # --- 嵌入模型設定 (保持不變，仍然使用本地 Ollama) ---
 EMBEDDING_MODEL = "mxbai-embed-large" # 使用較小的嵌入模型以提高速度
 
-# --- 混合檢索設定 ---
-USE_HYBRID_RETRIEVAL = True  # 是否使用混合檢索
-DENSE_WEIGHT = 0.5  # Dense retriever權重 (0.0-1.0)
-SPARSE_WEIGHT = 0.5  # BM25 retriever權重 (0.0-1.0)
-RETRIEVAL_K = 5  # 統一的檢索數量設定
-SIMILARITY_THRESHOLD = 0.05  # 統一的相似度閾值設定 (0.0-1.0，越高越嚴格)
-
-# --- 問答分離設定 ---
-USE_QA_SEPARATION = True  # 是否將問題和答案分離存儲（問題用於檢索，答案存在metadata中）
-
-# --- 新增：語音相關設定 ---
+# --- 語音相關設定 ---
 AUDIO_FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000  # 採樣率
 CHUNK = 1024  # 每次讀取的音訊片段大小
 RECORD_SECONDS = 10  # 預設錄音時間，可由用戶中止
 WAVE_OUTPUT_FILENAME = "temp_recording.wav"  # 臨時錄音文件
+SPEECH_LANGUAGE = "auto"  # 默認為自動檢測語言，其他選項: "zh"為中文，"en"為英文
 
 # --- Whisper 模型設定 ---
-WHISPER_MODEL_SIZE = "medium"  # 可選: "tiny", "base", "small", "medium", "large"
-SPEECH_LANGUAGE = "auto"  # 默認為自動檢測語言，其他選項: "zh"為中文，"en"為英文
-whisper_model = None  # 全局變量，用於存儲加載的Whisper模型
+WHISPER_MODEL_SIZE = "medium" # 可選: "tiny", "base", "small", "medium", "large"
+whisper_model = None # 全局變量，用於存儲加載的Whisper模型
 
-# --- 語音功能開關 ---
+# 終端文字樣式
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+# --- 混合檢索設定 ---
+USE_HYBRID_RETRIEVAL = True  # 是否使用混合檢索
+DENSE_WEIGHT = 0.5  # Dense retriever權重 (0.0-1.0)
+SPARSE_WEIGHT = 0.5  # BM25 retriever權重 (0.0-1.0)
+RETRIEVAL_K = 3  # 統一的檢索數量設定
+SIMILARITY_THRESHOLD = 0.1  # 統一的相似度閾值設定 (0.0-1.0，越高越嚴格)
+
+# --- 問答分離設定 ---
+USE_QA_SEPARATION = True  # 是否將問題和答案分離存儲（問題用於檢索，答案存在metadata中）
+
+# --- 語音輸入設定 ---
 ENABLE_VOICE_INPUT = True  # 是否啟用語音輸入功能
 
-# --- 新增：自動靜音檢測設定 ---
-SILENCE_THRESHOLD = 500  # 靜音閾值（音量低於此值視為靜音）
-SILENCE_DURATION = 2.0   # 連續靜音時間（秒），超過此時間自動停止錄音
-MIN_RECORD_DURATION = 1.0  # 最小錄音時間（秒），避免過短錄音
-
-# --- 新增：CoquiTTS設定 ---
-# 可以選擇不同的 Coqui TTS 模型，XTTS v2 是個不錯的多語言選擇
-# 查看可用模型: tts --list_models
-COQUI_TTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
-coqui_tts_model = None  # 全局變量，用於存儲加載的 Coqui TTS 模型
-playback_lock = threading.Lock()  # Lock for playback control
-
-# TTS 模型性能調整參數
-TTS_ENABLE_GPU = True  # 是否啟用 GPU 加速
-TTS_ENABLE_CACHE = True  # 是否啟用音頻緩存
-TTS_SAMPLE_RATE = 22050  # 音頻采樣率
-
-# 固定使用的說話人（可以根據偏好修改）
-FIXED_ZH_SPEAKER = "Tammie Ema"  # 中文固定說話人
-FIXED_EN_SPEAKER = "Tammie Ema"  # 英文固定說話人
-AVAILABLE_SPEAKERS = []  # 全局變量，存儲可用的說話人列表
-
-# 音頻緩存字典 {(text, language, speaker): audio_data}
-TTS_CACHE = {}  # 音頻緩存
-
-# --- 語音輸出功能開關 ---
-ENABLE_VOICE_OUTPUT = True  # 是否啟用語音輸出功能
-
-# --- 提示音功能開關 ---
-ENABLE_PROMPT_AUDIO = True  # 是否啟用提示音功能（在用戶提問後播放友好提示）
+# --- TTS語音輸出設定 ---
+ENABLE_TTS_OUTPUT = True  # 是否啟用TTS語音輸出功能
+TTS_MODEL_DIR = "./index_tts/checkpoints"  # TTS模型目錄
+TTS_CONFIG_PATH = "./index_tts/checkpoints/config.yaml"  # TTS配置文件路徑
+TTS_VOICE_PATH = "./voice/Dr_Lee.wav"  # 語音參考文件路徑
+tts_system = None  # 全局變量，用於存儲TTS系統
 
 # 檢查 Python 版本
 if sys.version_info < (3, 8):
     print("警告：您的 Python 版本較低，建議使用 Python 3.8 或更高版本以獲得最佳相容性。")
 
+# --- 新增：語音輸入相關函數 ---
+def load_whisper_model():
+    """載入Whisper模型"""
+    global whisper_model
+    
+    if whisper_model is None:
+        print(f"正在載入本地 Whisper 模型 ({WHISPER_MODEL_SIZE})...")
+        try:
+            # 檢查是否有GPU可用
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cuda":
+                print(f"使用 GPU 加速 Whisper 模型")
+            else:
+                print(f"未檢測到 GPU，使用 CPU 運行 Whisper 模型")
+                
+            whisper_model = whisper.load_model(WHISPER_MODEL_SIZE, device=device)
+            print(f"Whisper 模型載入成功")
+        except Exception as e:
+            print(f"載入 Whisper 模型時發生錯誤: {e}")
+            return False
+    
+    return True
+
+def record_audio(stop_event):
+    """接收音頻並保存為臨時文件"""
+    audio = pyaudio.PyAudio()
+    print("正在準備接收問題...")
+    
+    # 打開音頻流
+    stream = None # 初始化 stream 為 None
+    try:
+        stream = audio.open(format=AUDIO_FORMAT,
+                            channels=CHANNELS,
+                            rate=RATE,
+                            input=True,
+                            frames_per_buffer=CHUNK)
+        
+        print("開始錄音...（按下Enter鍵停止錄音）")
+        frames = []
+        
+        # 實時音量顯示
+        while not stop_event.is_set():
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                frames.append(data)
+                
+                # 顯示音量指示器（可選）
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                volume = np.abs(audio_data).mean()
+                bars = int(50 * volume / 4000)
+                print("\r[" + "=" * bars + " " * (50 - bars) + "]", end="", flush=True)
+            except IOError as e:
+                # 忽略 PyAudio 在某些情況下可能拋出的輸入溢出錯誤
+                if e.errno == pyaudio.paInputOverflowed:
+                    print("\n警告：音頻輸入溢出，忽略部分數據。", end="")
+                else:
+                    raise # 重新拋出其他IOError
+                
+    except KeyboardInterrupt:
+        print("\n錄音被中斷。")
+    except Exception as e:
+        print(f"\n錄音過程中發生錯誤: {e}")
+    finally:
+        print("\n錄音結束，正在停止錄音並保存...")
+        
+        # 停止和關閉流
+        if stream is not None:
+            try:
+                if stream.is_active(): # 僅在流活躍時停止
+                    stream.stop_stream()
+                stream.close()
+            except Exception as e:
+                print(f"關閉音頻流時出錯: {e}")
+                
+        audio.terminate()
+        
+        # 只有在錄到數據時才保存文件
+        if frames:
+            try:
+                wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(audio.get_sample_size(AUDIO_FORMAT))
+                wf.setframerate(RATE)
+                wf.writeframes(b''.join(frames))
+                wf.close()
+                print(f"音頻已保存為 {WAVE_OUTPUT_FILENAME}")
+            except Exception as e:
+                print(f"保存音頻文件時出錯: {e}")
+        else:
+            print("未錄製到有效音頻數據，不保存文件。")
+
+def speech_to_text():
+    """使用本地Whisper將語音轉換為文字，並返回偵測到的語言"""
+    try:
+        if not os.path.exists(WAVE_OUTPUT_FILENAME):
+            return "", "zh"  # 默認返回中文作為語言，空字串作為文字
+        
+        # 載入Whisper模型
+        if not load_whisper_model():
+            return "", "zh"
+            
+        print(f"正在使用本地Whisper模型轉換語音為文字 (語言: {'自動檢測' if SPEECH_LANGUAGE == 'auto' else SPEECH_LANGUAGE})...")
+        
+        # 使用Whisper模型進行語音識別
+        transcribe_options = {
+            "fp16": torch.cuda.is_available()  # 如果有GPU，使用fp16加速
+        }
+        
+        # 只有在非自動模式下才指定語言
+        if SPEECH_LANGUAGE != "auto":
+            transcribe_options["language"] = SPEECH_LANGUAGE
+        
+        # 使用動態參數調用transcribe
+        result = whisper_model.transcribe(
+            WAVE_OUTPUT_FILENAME,
+            **transcribe_options
+        )
+            
+        # 刪除臨時音頻文件
+        if os.path.exists(WAVE_OUTPUT_FILENAME):
+            os.remove(WAVE_OUTPUT_FILENAME)
+            
+        text = result["text"].strip()
+        detected_language = result.get("language", "zh")  # 獲取偵測到的語言代碼，默認中文
+        print(f"\n語音識別結果 (檢測到的語言: {detected_language})：「{text}」")
+        return text, detected_language
+    
+    except Exception as e:
+        print(f"語音轉文字時發生錯誤: {e}")
+        if os.path.exists(WAVE_OUTPUT_FILENAME):
+            os.remove(WAVE_OUTPUT_FILENAME)
+        return "", "zh"  # 錯誤時默認返回中文作為語言
+
+def map_whisper_language_to_supported(detected_lang):
+    """將 Whisper 檢測的語言代碼映射到我們支持的語言"""
+    lang_map = {
+        "zh": "zh", "cn": "zh", "ja": "zh", "ko": "zh",  # 亞洲語言使用中文回答
+        "en": "en", "fr": "en", "de": "en", "es": "en", "my": "en",  # 西方語言使用英文回答
+    }
+    # 默認使用中文回答
+    return lang_map.get(detected_lang, "zh")
+
+# --- 新增：TTS語音輸出相關函數 ---
+def load_tts_system():
+    """載入TTS系統"""
+    global tts_system
+    
+    if tts_system is None:
+        print(f"正在載入TTS語音合成系統...")
+        try:
+            # 檢查必要的文件是否存在
+            if not os.path.exists(TTS_MODEL_DIR):
+                print(f"錯誤：TTS模型目錄不存在: {TTS_MODEL_DIR}")
+                return False
+            
+            if not os.path.exists(TTS_CONFIG_PATH):
+                print(f"錯誤：TTS配置文件不存在: {TTS_CONFIG_PATH}")
+                return False
+                
+            if not os.path.exists(TTS_VOICE_PATH):
+                print(f"錯誤：語音參考文件不存在: {TTS_VOICE_PATH}")
+                return False
+            
+            # 初始化TTS系統
+            tts_system = IndexTTS(model_dir=TTS_MODEL_DIR, cfg_path=TTS_CONFIG_PATH)
+            print(f"TTS系統載入成功 (使用語音: {os.path.basename(TTS_VOICE_PATH)})")
+            return True
+            
+        except Exception as e:
+            print(f"載入TTS系統時發生錯誤: {e}")
+            print("請檢查TTS模型和相關文件是否正確安裝。")
+            return False
+    
+    return True
+
+def text_to_speech(text):
+    """將文本轉換為語音並播放"""
+    if not ENABLE_TTS_OUTPUT:
+        return False
+        
+    try:
+        # 載入TTS系統
+        if not load_tts_system():
+            return False
+        
+        # 清理文本，去除特殊字符和過長內容
+        cleaned_text = clean_text_for_tts(text)
+        if not cleaned_text:
+            print("文本清理後為空，跳過語音合成")
+            return False
+        
+        print(f"正在生成語音... (文本長度: {len(cleaned_text)})")
+        
+        # 生成音頻數據
+        sampling_rate, wav_data = tts_system.infer(
+            TTS_VOICE_PATH, 
+            cleaned_text, 
+            output_path=None  # 不保存到文件，直接返回音頻數據
+        )
+        
+        print(f"語音生成完成！採樣率: {sampling_rate} Hz, 時長: {len(wav_data) / sampling_rate:.2f} 秒")
+        
+        # 播放音頻
+        print("正在播放語音...")
+        sd.play(wav_data, sampling_rate)
+        sd.wait()  # 等待播放完成
+        print("語音播放完成！")
+        
+        return True
+        
+    except Exception as e:
+        print(f"TTS語音合成時發生錯誤: {e}")
+        return False
+
+def clean_text_for_tts(text):
+    """清理文本以適合TTS合成"""
+    if not text:
+        return ""
+    
+    # 移除多餘的空白字符
+    text = re.sub(r'\s+', ' ', text.strip())
+    
+    # 移除特殊符號，但保留基本標點
+    text = re.sub(r'[^\w\s，。！？：；、（）「」『』\-]', '', text)
+    
+    # 限制文本長度（避免過長的文本）
+    max_length = 500  # 最大字符數
+    if len(text) > max_length:
+        # 在句號處截斷
+        sentences = re.split(r'[。！？]', text[:max_length])
+        if len(sentences) > 1:
+            text = '。'.join(sentences[:-1]) + '。'
+        else:
+            text = text[:max_length] + '...'
+    
+    return text
+
+def ask_tts_preference():
+    """詢問用戶是否要啟用TTS語音輸出"""
+    if not ENABLE_TTS_OUTPUT:
+        return False
+        
+    try:
+        choice = input("是否啟用TTS語音輸出功能？(y/n，默認為y): ").strip().lower()
+        return choice != 'n'
+    except:
+        return True  # 默認啟用
 
 # --- 新增: 按段落處理PDF文件 ---
 def load_pdf_by_paragraph(pdf_path: str):
@@ -770,728 +958,6 @@ def create_bm25_retriever(texts, cache_dir=BM25_CACHE_DIR):
         print(f"建立BM25檢索器時發生錯誤: {e}")
         return None
 
-# --- 新增: Whisper 語音識別功能 ---
-def load_whisper_model():
-    """載入Whisper模型"""
-    global whisper_model
-    
-    if whisper_model is None:
-        print(f"正在載入本地 Whisper 模型 ({WHISPER_MODEL_SIZE})...")
-        try:
-            # 檢查是否有GPU可用
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if device == "cuda":
-                print(f"使用 GPU 加速 Whisper 模型")
-            else:
-                print(f"未檢測到 GPU，使用 CPU 運行 Whisper 模型")
-                
-            whisper_model = whisper.load_model(WHISPER_MODEL_SIZE, device=device)
-            print(f"Whisper 模型載入成功")
-        except Exception as e:
-            print(f"載入 Whisper 模型時發生錯誤: {e}")
-            return False
-    
-    return True
-
-def record_audio(stop_event):
-    """接收音頻並保存為臨時文件"""
-    try:
-        audio = pyaudio.PyAudio()
-    except Exception as e:
-        print(f"❌ 初始化音頻設備失敗: {e}")
-        print("請確保：")
-        print("1. 已安裝 pyaudio: pip install pyaudio")
-        print("2. 系統有可用的音頻輸入設備")
-        print("3. 在 Windows 上可能需要安裝 Microsoft Visual C++ Redistributable")
-        return
-        
-    # 打開音頻流
-    stream = None  # 初始化 stream 為 None
-    try:
-        # 檢查可用的音頻設備
-        device_count = audio.get_device_count()
-        
-        # 尋找默認輸入設備
-        default_input_device = None
-        try:
-            default_input_device = audio.get_default_input_device_info()
-        except Exception as e:
-            # 嘗試尋找第一個可用的輸入設備
-            for i in range(device_count):
-                try:
-                    device_info = audio.get_device_info_by_index(i)
-                    if device_info['maxInputChannels'] > 0:
-                        break
-                except:
-                    continue
-        
-        stream = audio.open(format=AUDIO_FORMAT,
-                            channels=CHANNELS,
-                            rate=RATE,
-                            input=True,
-                            frames_per_buffer=CHUNK)
-        
-        frames = []
-        print("🎤 正在錄音中...")
-        print("📊 音量指示器：")
-        
-        # 實時音量顯示
-        while not stop_event.is_set():
-            try:
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                frames.append(data)
-                
-                # 顯示音量指示器
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                volume = np.abs(audio_data).mean()
-                bars = int(50 * volume / 4000)
-                volume_bar = "🔊 [" + "=" * bars + " " * (50 - bars) + "]"
-                print(f"\r{volume_bar} 📢 再按 Enter 停止錄音", end="", flush=True)
-                
-            except IOError as e:
-                # 忽略 PyAudio 在某些情況下可能拋出的輸入溢出錯誤
-                if hasattr(e, 'errno') and e.errno == pyaudio.paInputOverflowed:
-                    print("\n⚠️  音頻輸入溢出，忽略部分數據。", end="")
-                else:
-                    print(f"\n❌ 音頻讀取錯誤: {e}")
-                    break
-                
-    except KeyboardInterrupt:
-        print("\n⏹️ 錄音被中斷。")
-    except Exception as e:
-        print(f"\n❌ 錄音過程中發生錯誤: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("\n⏹️ 錄音結束，正在處理音頻...")
-        
-        # 停止和關閉流
-        if stream is not None:
-            try:
-                if stream.is_active():  # 僅在流活躍時停止
-                    stream.stop_stream()
-                stream.close()
-            except Exception as e:
-                print(f"❌ 關閉音頻流時出錯: {e}")
-                
-        audio.terminate()
-        
-        # 只有在錄到數據時才保存文件
-        if 'frames' in locals() and frames:
-            try:
-                wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(audio.get_sample_size(AUDIO_FORMAT))
-                wf.setframerate(RATE)
-                wf.writeframes(b''.join(frames))
-                wf.close()
-                print("✅ 音頻文件保存成功")
-            except Exception as e:
-                print(f"❌ 保存音頻文件時出錯: {e}")
-        else:
-            print("⚠️  未錄製到有效音頻數據。")
-
-def speech_to_text():
-    """使用本地Whisper將語音轉換為文字，並返回偵測到的語言"""
-    try:
-        if not os.path.exists(WAVE_OUTPUT_FILENAME):
-            return "", "zh"  # 默認返回中文作為語言，空字串作為文字
-        
-        # 載入Whisper模型
-        if not load_whisper_model():
-            return "", "zh"
-            
-        print(f"🤖 正在識別語音...")
-        
-        # 使用Whisper模型進行語音識別
-        transcribe_options = {
-            "fp16": torch.cuda.is_available()  # 如果有GPU，使用fp16加速
-        }
-        
-        # 只有在非自動模式下才指定語言
-        if SPEECH_LANGUAGE != "auto":
-            transcribe_options["language"] = SPEECH_LANGUAGE
-        
-        # 使用動態參數調用transcribe
-        result = whisper_model.transcribe(
-            WAVE_OUTPUT_FILENAME,
-            **transcribe_options
-        )
-            
-        # 刪除臨時音頻文件
-        if os.path.exists(WAVE_OUTPUT_FILENAME):
-            os.remove(WAVE_OUTPUT_FILENAME)
-            
-        text = result["text"].strip()
-        detected_language = result.get("language", "zh")  # 獲取偵測到的語言代碼，默認中文
-        
-        # 根據檢測到的語言顯示不同的 emoji
-        lang_emoji = "🇨🇳" if detected_language in ["zh", "cn"] else "🇺🇸" if detected_language == "en" else "🌐"
-        print(f"{lang_emoji} 語音識別完成 ({detected_language})")
-        
-        return text, detected_language
-    
-    except Exception as e:
-        print(f"❌ 語音轉文字時發生錯誤: {e}")
-        if os.path.exists(WAVE_OUTPUT_FILENAME):
-            os.remove(WAVE_OUTPUT_FILENAME)
-        return "", "zh"  # 錯誤時默認返回中文作為語言
-
-def map_whisper_language_to_supported(detected_lang):
-    """將 Whisper 檢測的語言代碼映射到我們支持的語言"""
-    lang_map = {
-        "zh": "zh", "cn": "zh", "ja": "zh", "ko": "zh",  # 亞洲語言使用中文回答
-        "en": "en", "fr": "en", "de": "en", "es": "en", "my": "en",  # 西方語言使用英文回答
-    }
-    # 默認使用中文回答
-    return lang_map.get(detected_lang, "zh")
-
-def process_voice_input(qa_chain):
-    """處理語音輸入的完整流程"""
-    try:
-        print("🎙️ 語音輸入模式")
-        print("📝 使用方法：")
-        print("   🎯 按 Enter 開始錄音並說出您的問題")
-        print("   ⏹️ 再按 Enter 停止錄音")
-        print("   ⚡ 系統將自動識別並回答")
-        
-        # 直接開始錄音，不需要額外確認
-        print("🚀 開始錄音！請說出您的問題...")
-        
-        # 創建停止事件
-        stop_event = threading.Event()
-        
-        # 創建錄音線程
-        record_thread = threading.Thread(target=record_audio, args=(stop_event,))
-        record_thread.start()
-        
-        # 等待用戶按下Enter鍵停止錄音
-        input()  # 等待按Enter停止錄音
-        stop_event.set()
-        record_thread.join()
-        
-        # 語音轉文字，並獲取偵測到的語言
-        print("🤖 正在識別語音，請稍候...")
-        question, detected_lang = speech_to_text()
-        if not question:
-            print("❌ 無法識別語音內容，請重試。")
-            print("💡 建議：")
-            print("   - 確保麥克風工作正常")
-            print("   - 說話聲音清晰")
-            print("   - 環境相對安靜")
-            return None
-        
-        # 處理識別出的文字，檢查是否為退出命令
-        if question.lower().strip() in ["退出", "結束", "exit", "quit"]:
-            print("🔊 語音指令: 退出程式")
-            return "exit"
-            
-        # 忽略空問題
-        if not question.strip():
-            print("⚠️ 識別到空內容，請重試。")
-            return None
-        
-        print(f"✅ 語音識別成功！")
-        print(f"📝 您的問題：{question}")
-        return question, detected_lang  # 返回問題和檢測到的語言
-        
-    except Exception as e:
-        print(f"❌ 處理語音輸入時發生錯誤: {e}")
-        return None
-
-# --- 新增: 語音功能依賴檢查 ---
-def check_voice_dependencies():
-    """檢查語音功能所需的依賴是否安裝"""
-    missing_deps = []
-    
-    try:
-        import pyaudio
-    except ImportError:
-        missing_deps.append("pyaudio")
-    
-    try:
-        import whisper
-    except ImportError:
-        missing_deps.append("openai-whisper")
-    
-    try:
-        import torch
-    except ImportError:
-        missing_deps.append("torch")
-    
-    try:
-        import numpy
-    except ImportError:
-        missing_deps.append("numpy")
-    
-    # 檢查TTS相關依賴
-    try:
-        import TTS
-    except ImportError:
-        missing_deps.append("TTS")
-    
-    try:
-        import pydub
-    except ImportError:
-        missing_deps.append("pydub")
-    
-    try:
-        import simpleaudio
-    except ImportError:
-        missing_deps.append("simpleaudio")
-    
-    if missing_deps:
-        print("⚠️  語音功能依賴缺失：")
-        for dep in missing_deps:
-            print(f"   - {dep}")
-        print("\n要安裝缺失的依賴，請運行：")
-        print("pip install " + " ".join(missing_deps))
-        print("\n或者安裝所有語音功能依賴：")
-        print("pip install -r requirements_voice.txt")
-        return False
-    
-    return True
-
-def initialize_voice_features():
-    """初始化語音功能"""
-    global ENABLE_VOICE_INPUT, ENABLE_VOICE_OUTPUT
-    
-    if not ENABLE_VOICE_INPUT and not ENABLE_VOICE_OUTPUT:
-        return True
-    
-    print("正在檢查語音功能依賴...")
-    if not check_voice_dependencies():
-        print("語音功能將被禁用，您仍可以使用文字輸入輸出功能。")
-        ENABLE_VOICE_INPUT = False
-        ENABLE_VOICE_OUTPUT = False
-        return False
-    
-    print("語音功能依賴檢查通過！")
-    
-    # 初始化語音輸入功能
-    if ENABLE_VOICE_INPUT:
-        try:
-            print("正在預載入 Whisper 模型...")
-            if load_whisper_model():
-                print("Whisper 模型預載入成功！")
-            else:
-                print("Whisper 模型預載入失敗，將在需要時再次嘗試載入。")
-        except Exception as e:
-            print(f"預載入 Whisper 模型時出現錯誤: {e}")
-            print("語音輸入功能可能無法正常工作。")
-    
-    # 初始化TTS功能
-    if ENABLE_VOICE_OUTPUT:
-        try:
-            print("正在初始化 Coqui TTS...")
-            if initialize_coqui_tts():
-                print("Coqui TTS 初始化成功！")
-            else:
-                print("Coqui TTS 初始化失敗，TTS功能將被禁用。")
-                ENABLE_VOICE_OUTPUT = False
-        except Exception as e:
-            print(f"初始化 Coqui TTS 時出現錯誤: {e}")
-            print("TTS功能將被禁用。")
-            ENABLE_VOICE_OUTPUT = False
-    
-    return True
-
-# --- 新增：CoquiTTS 語音合成功能 ---
-def initialize_coqui_tts():
-    """載入 Coqui TTS 模型並進行必要的預熱"""
-    global coqui_tts_model, AVAILABLE_SPEAKERS
-    if coqui_tts_model is None:
-        print(f"正在初始化 Coqui TTS 引擎 (模型: {COQUI_TTS_MODEL_NAME})...")
-        try:
-            # PyInstaller 兼容性修復
-            if getattr(sys, 'frozen', False):
-                print("檢測到 PyInstaller 打包環境，應用 TTS 特定修復...")
-                
-                # 修復 inflect 套件的 engine 函數
-                try:
-                    import inflect
-                    # 創建一個簡化的 engine 實例，避免源碼檢查
-                    def create_safe_engine():
-                        try:
-                            return inflect.engine()
-                        except (OSError, IOError):
-                            # 如果標準方法失敗，創建一個最小化的替代實現
-                            class MinimalEngine:
-                                def plural(self, word, count=2):
-                                    if count == 1:
-                                        return word
-                                    # 簡單的複數規則
-                                    if word.endswith(('s', 'sh', 'ch', 'x', 'z')):
-                                        return word + 'es'
-                                    elif word.endswith('y'):
-                                        return word[:-1] + 'ies'
-                                    else:
-                                        return word + 's'
-                                        
-                                def ordinal(self, num):
-                                    return str(num) + {1: 'st', 2: 'nd', 3: 'rd'}.get(num % 10, 'th')
-                                    
-                                def number_to_words(self, num):
-                                    return str(num)  # 簡化實現
-                                    
-                            return MinimalEngine()
-                    
-                    # 替換 inflect.engine 函數
-                    inflect.engine = create_safe_engine
-                    print("✅ 已修復 inflect 套件的 PyInstaller 兼容性問題")
-                    
-                except ImportError:
-                    print("inflect 套件未找到，跳過修復")
-                except Exception as inflect_fix_err:
-                    print(f"修復 inflect 套件時出錯: {inflect_fix_err}")
-            
-            device = "cuda" if torch.cuda.is_available() and TTS_ENABLE_GPU else "cpu"
-            print(f"使用 {'GPU' if device == 'cuda' else 'CPU'} 運行 Coqui TTS 模型")
-
-            # --- Fix for PyTorch >= 2.6 loading issue with XTTS ---
-            try:
-                from TTS.tts.configs.xtts_config import XttsConfig
-                from TTS.tts.models.xtts import XttsAudioConfig
-                from TTS.config.shared_configs import BaseDatasetConfig
-                from TTS.tts.models.xtts import XttsArgs
-
-                safe_classes = [XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs]
-                torch.serialization.add_safe_globals(safe_classes)
-                print(f"已將 TTS 相關類加入 PyTorch 安全全局列表")
-            except ImportError as imp_err:
-                print(f"警告：無法導入 XTTS 相關類 ({imp_err})，如果您未使用 XTTS 模型，可以忽略此訊息")
-            except Exception as safe_global_err:
-                print(f"嘗試將 TTS 相關類加入安全全局列表時出錯: {safe_global_err}")
-
-            # 配置並初始化 TTS 模型
-            start_time = time.time()
-            coqui_tts_model = TTS(model_name=COQUI_TTS_MODEL_NAME, gpu=(device == "cuda"))
-            load_time = time.time() - start_time
-            print(f"Coqui TTS 引擎加載耗時: {load_time:.2f} 秒")
-            
-            # 獲取並保存可用的說話人列表
-            try:
-                if hasattr(coqui_tts_model, 'synthesizer') and \
-                   hasattr(coqui_tts_model.synthesizer, 'tts_model') and \
-                   hasattr(coqui_tts_model.synthesizer.tts_model, 'speaker_manager') and \
-                   hasattr(coqui_tts_model.synthesizer.tts_model.speaker_manager, 'speakers'):
-                    
-                    AVAILABLE_SPEAKERS = list(coqui_tts_model.synthesizer.tts_model.speaker_manager.speakers.keys())
-                    print(f"可用的說話人列表: {AVAILABLE_SPEAKERS}")
-                    print(f"默認中文說話人: {FIXED_ZH_SPEAKER}")
-                    print(f"默認英文說話人: {FIXED_EN_SPEAKER}")
-                    
-                    # 驗證默認說話人是否可用
-                    if FIXED_ZH_SPEAKER not in AVAILABLE_SPEAKERS:
-                        print(f"警告: 默認中文說話人 '{FIXED_ZH_SPEAKER}' 不在可用列表中。將使用第一個可用說話人。")
-                    if FIXED_EN_SPEAKER not in AVAILABLE_SPEAKERS:
-                        print(f"警告: 默認英文說話人 '{FIXED_EN_SPEAKER}' 不在可用列表中。將使用第一個可用說話人。")
-            except Exception as spk_err:
-                print(f"獲取說話人列表時出錯: {spk_err}")
-                AVAILABLE_SPEAKERS = []
-            
-            # 模型預熱，降低首次生成延遲
-            try:
-                print("進行 TTS 模型預熱...")
-                warmup_start = time.time()
-                
-                # 選擇預熱說話人
-                warmup_speaker = None
-                if FIXED_ZH_SPEAKER in AVAILABLE_SPEAKERS:
-                    warmup_speaker = FIXED_ZH_SPEAKER
-                elif FIXED_EN_SPEAKER in AVAILABLE_SPEAKERS:
-                    warmup_speaker = FIXED_EN_SPEAKER
-                elif AVAILABLE_SPEAKERS:
-                    warmup_speaker = AVAILABLE_SPEAKERS[0]
-                
-                # 進行短文本預熱
-                if warmup_speaker:
-                    # 中文預熱
-                    warmup_text_zh = "這是一個預熱測試。"
-                    zh_kwargs = {
-                        "text": warmup_text_zh,
-                        "language": "zh-cn"
-                    }
-                    if warmup_speaker:
-                        zh_kwargs["speaker"] = warmup_speaker
-                    _ = coqui_tts_model.tts(**zh_kwargs)
-                    
-                    # 英文預熱
-                    warmup_text_en = "This is a warmup test."
-                    en_kwargs = {
-                        "text": warmup_text_en,
-                        "language": "en"
-                    }
-                    if warmup_speaker:
-                        en_kwargs["speaker"] = warmup_speaker
-                    _ = coqui_tts_model.tts(**en_kwargs)
-                
-                warmup_time = time.time() - warmup_start
-                print(f"TTS 模型預熱完成，耗時: {warmup_time:.2f} 秒")
-            except Exception as warmup_err:
-                print(f"模型預熱過程中出錯: {warmup_err}")
-                print("繼續執行，但首次生成可能較慢。")
-            
-            print("Coqui TTS 引擎初始化成功。")
-            return True
-        except Exception as e:
-            print(f"初始化 Coqui TTS 引擎時發生錯誤: {e}")
-            print("請確保 TTS 庫已正確安裝，且模型文件存在或可下載。")
-            print("如果使用 GPU，請確認 CUDA 環境配置正確。")
-            import traceback
-            print("詳細錯誤追蹤：")
-            traceback.print_exc()
-            coqui_tts_model = None
-            return False
-    return True
-
-def text_to_speech(text, language="zh"):
-    """使用 Coqui TTS 生成語音數據並播放
-    
-    參數:
-        text (str): 要播放的文字內容
-        language (str): 語言代碼，'zh' 表示中文，'en' 表示英文
-    """
-    global coqui_tts_model, AVAILABLE_SPEAKERS, TTS_CACHE
-    
-    if not ENABLE_VOICE_OUTPUT:
-        return True  # 如果語音輸出被禁用，直接返回成功
-        
-    if not coqui_tts_model:
-        print("⚠️ Coqui TTS 模型未初始化，無法生成語音。")
-        return False
-
-    if not text or len(text.strip()) == 0:
-        print("⚠️ 嘗試播放空文本")
-        return False
-
-    # 映射語言代碼
-    coqui_lang = 'zh-cn' if language == 'zh' else 'en'
-    
-    # 根據語言選擇固定的說話人
-    if language == 'zh':
-        selected_speaker = FIXED_ZH_SPEAKER if FIXED_ZH_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
-    else:  # 'en'
-        selected_speaker = FIXED_EN_SPEAKER if FIXED_EN_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
-    
-    if not selected_speaker:
-        print("❌ 找不到可用的說話人。")
-        return False
-
-    # 生成緩存鍵
-    cache_key = (text, coqui_lang, selected_speaker)
-    
-    print(f"🔊 使用 Coqui TTS ({coqui_lang}, 說話人: {selected_speaker}) 播放: {text[:30]}...")
-    
-    with playback_lock:
-        try:
-            # 檢查緩存中是否已有此文本的音頻
-            if TTS_ENABLE_CACHE and cache_key in TTS_CACHE:
-                print("📦 從緩存中獲取音頻...")
-                wav = TTS_CACHE[cache_key]
-            else:
-                # 生成音頻數據
-                print(f"🎵 生成音頻數據中...")
-                
-                tts_kwargs = {
-                    "text": text,
-                    "language": coqui_lang,
-                    "speaker": selected_speaker
-                }
-                
-                start_time = time.time()
-                wav = coqui_tts_model.tts(**tts_kwargs)
-                tts_time = time.time() - start_time
-                print(f"✅ 音頻生成完成，耗時: {tts_time:.2f} 秒")
-                
-                # 緩存生成的音頻
-                if TTS_ENABLE_CACHE:
-                    TTS_CACHE[cache_key] = wav
-            
-            # 獲取采樣率
-            sample_rate = TTS_SAMPLE_RATE
-            if hasattr(coqui_tts_model, 'synthesizer') and hasattr(coqui_tts_model.synthesizer, 'output_sample_rate'):
-                sample_rate = coqui_tts_model.synthesizer.output_sample_rate
-            
-            # 通過 simpleaudio 播放
-            try:
-                # 將浮點數組轉換為 int16 格式
-                wav = np.clip(wav, -1.0, 1.0)
-                wav_int16 = (wav * 32767).astype(np.int16)
-                
-                # 播放音頻
-                print("🎵 正在播放...")
-                play_obj = sa.play_buffer(
-                    wav_int16,
-                    num_channels=1,
-                    bytes_per_sample=2,
-                    sample_rate=sample_rate
-                )
-                
-                play_obj.wait_done()
-                print("✅ 播放完成")
-                return True
-                
-            except sa.exceptions.SimpleaudioError as sa_error:
-                print(f"❌ Simpleaudio 播放時發生錯誤: {sa_error}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ TTS 生成或播放過程中發生錯誤: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-def play_prompt_audio(detected_language="zh"):
-    """播放提示音，在用戶提問後、系統開始思考時播放
-    
-    參數:
-        detected_language (str): 檢測到的語言，'zh' 表示中文，'en' 表示英文
-    """
-    global coqui_tts_model, AVAILABLE_SPEAKERS, TTS_CACHE
-    
-    if not ENABLE_VOICE_OUTPUT or not coqui_tts_model:
-        return True  # 如果語音輸出被禁用或模型未初始化，直接返回
-    
-    # 創建一個非阻塞的提示音播放函數
-    def play_prompt_in_background():
-        # 這裡創建一個新的鎖，避免與主要playback_lock衝突
-        prompt_lock = threading.Lock()
-        with prompt_lock:
-            try:
-                # 根據檢測到的語言選擇提示音文本
-                if detected_language == "en":
-                    # 英文提示音
-                    prompt_text = "Thank you for your question. Let me think about it for a moment."
-                    prompt_lang = "en"
-                else:
-                    # 中文提示音
-                    prompt_text = "感謝您的提問，我思考一下請稍候！"
-                    prompt_lang = "zh-cn"
-                    
-                # 選擇相應語言的說話人
-                if prompt_lang == "zh-cn":
-                    selected_speaker = FIXED_ZH_SPEAKER if FIXED_ZH_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
-                else:
-                    selected_speaker = FIXED_EN_SPEAKER if FIXED_EN_SPEAKER in AVAILABLE_SPEAKERS else (AVAILABLE_SPEAKERS[0] if AVAILABLE_SPEAKERS else None)
-                    
-                if not selected_speaker:
-                    print("⚠️ 找不到可用的說話人，無法播放提示音")
-                    return
-                
-                # 生成緩存鍵
-                cache_key = (prompt_text, prompt_lang, selected_speaker)
-                
-                print(f"🎵 播放提示音 ({prompt_lang})...")
-                
-                # 檢查緩存
-                if TTS_ENABLE_CACHE and cache_key in TTS_CACHE:
-                    wav = TTS_CACHE[cache_key]
-                else:
-                    # 生成提示音
-                    tts_kwargs = {
-                        "text": prompt_text,
-                        "language": prompt_lang,
-                        "speaker": selected_speaker
-                    }
-                    
-                    wav = coqui_tts_model.tts(**tts_kwargs)
-                    
-                    # 緩存生成的音頻
-                    if TTS_ENABLE_CACHE:
-                        TTS_CACHE[cache_key] = wav
-                
-                # 獲取采樣率
-                sample_rate = TTS_SAMPLE_RATE
-                if hasattr(coqui_tts_model, 'synthesizer') and hasattr(coqui_tts_model.synthesizer, 'output_sample_rate'):
-                    sample_rate = coqui_tts_model.synthesizer.output_sample_rate
-                    
-                # 播放音頻
-                wav = np.clip(wav, -1.0, 1.0)
-                wav_int16 = (wav * 32767).astype(np.int16)
-                play_obj = sa.play_buffer(
-                    wav_int16,
-                    num_channels=1,
-                    bytes_per_sample=2,
-                    sample_rate=sample_rate
-                )
-                play_obj.wait_done()
-                print("✅ 提示音播放完成")
-                
-            except Exception as e:
-                print(f"❌ 播放提示音時發生錯誤: {e}")
-    
-    # 在後台線程中播放提示音，避免阻塞主程序
-    try:
-        prompt_thread = threading.Thread(target=play_prompt_in_background, daemon=True)
-        prompt_thread.start()
-        return True
-    except Exception as e:
-        print(f"⚠️ 啟動提示音線程時發生錯誤: {e}")
-        return False
-
-def check_tts_dependencies():
-    """檢查TTS功能所需的依賴是否安裝"""
-    missing_deps = []
-    
-    try:
-        import TTS
-    except ImportError:
-        missing_deps.append("TTS")
-    
-    try:
-        import pydub
-    except ImportError:
-        missing_deps.append("pydub")
-    
-    try:
-        import simpleaudio
-    except ImportError:
-        missing_deps.append("simpleaudio")
-    
-    if missing_deps:
-        print("⚠️  TTS功能依賴缺失：")
-        for dep in missing_deps:
-            print(f"   - {dep}")
-        print("\n要安裝缺失的依賴，請運行：")
-        print("pip install " + " ".join(missing_deps))
-        return False
-    
-    return True
-
-def initialize_tts_features():
-    """初始化TTS功能"""
-    global ENABLE_VOICE_OUTPUT
-    
-    if not ENABLE_VOICE_OUTPUT:
-        return True
-    
-    print("正在檢查TTS功能依賴...")
-    if not check_tts_dependencies():
-        print("TTS功能將被禁用，您仍可以使用文字輸出功能。")
-        ENABLE_VOICE_OUTPUT = False
-        return False
-    
-    print("TTS功能依賴檢查通過！")
-    
-    # 初始化 Coqui TTS
-    try:
-        print("正在初始化 Coqui TTS...")
-        if initialize_coqui_tts():
-            print("Coqui TTS 初始化成功！")
-            return True
-        else:
-            print("Coqui TTS 初始化失敗，TTS功能將被禁用。")
-            ENABLE_VOICE_OUTPUT = False
-            return False
-    except Exception as e:
-        print(f"初始化 Coqui TTS 時出現錯誤: {e}")
-        print("TTS功能將被禁用。")
-        ENABLE_VOICE_OUTPUT = False
-        return False
-
-# --- 新增: 語音功能依賴檢查 ---
-
 # --- 主要執行流程 ---
 if __name__ == "__main__":
     # --- 步驟 0: 清理舊的向量儲存和BM25快取 ---
@@ -1566,54 +1032,58 @@ if __name__ == "__main__":
         print("QA 鏈建立失敗，程式終止。")
         sys.exit(1)
 
-    # --- 初始化語音功能 (如果啟用) ---
-    if ENABLE_VOICE_INPUT or ENABLE_VOICE_OUTPUT:
-        initialize_voice_features()
-
     # --- 步驟 6: 查詢迴圈 ---
     print("===================================")
     print(f" RAG 系統已就緒 (LLM: {LLM_PROVIDER.upper()})！")
     print(f" 檢索模式: {'混合檢索 (Dense + BM25)' if USE_HYBRID_RETRIEVAL else '純Dense檢索'}")
     if USE_HYBRID_RETRIEVAL:
         print(f" 權重配置: Dense={DENSE_WEIGHT}, BM25={SPARSE_WEIGHT}")
-    
+
+    # 預載入Whisper模型 (如果啟用語音輸入)
     if ENABLE_VOICE_INPUT:
-        print(" 🎙️ 語音輸入模式已啟用（主要模式）")
-        print(" 🎯 語音輸入流程：")
-        print("    🎤 按 Enter 開始錄音並說出問題")
-        print("    ⏹️ 再按 Enter 結束錄音")
-    
-    if ENABLE_VOICE_OUTPUT:
-        print(" 🔊 語音輸出模式已啟用")
-        print("    系統將自動播放答案語音")
-        if ENABLE_PROMPT_AUDIO:
-            print("    🎵 提示音功能已啟用（問題處理時播放友好提示）")
-    
-    if ENABLE_VOICE_INPUT or ENABLE_VOICE_OUTPUT:
-        print(" 特殊指令：")
-        if ENABLE_VOICE_INPUT:
-            print(" - 輸入 'text' 或 't' 切換到文字輸入模式")
-        print(" - 輸入 'quit' 或 'exit' 來結束程式")
-        print(" - 輸入 'debug' 切換調試模式（顯示檢索詳情）")
-        print(" - 輸入 'help' 查看優化建議")
+        print("預載入語音識別模型（可能需要一些時間）...")
+        load_whisper_model()
+        print(f" 語音輸入功能: 已啟用 (Whisper模型: {WHISPER_MODEL_SIZE})")
     else:
-        print(" 請輸入您的問題（關於 PDF 文件的內容）。")
-        print(" 輸入 'quit' 或 'exit' 來結束程式。")
-        print(" 輸入 'debug' 切換調試模式（顯示檢索詳情）。")
-        print(" 輸入 'help' 查看優化建議。")
+        print(" 語音輸入功能: 未啟用")
+
+    # 預載入TTS系統 (如果啟用語音輸出)
+    tts_enabled = False
+    if ENABLE_TTS_OUTPUT:
+        print("正在初始化TTS語音輸出功能...")
+        print("預載入TTS語音合成系統（可能需要一些時間）...")
+        if load_tts_system():
+            print(f" TTS語音輸出功能: 已啟用 (語音: {os.path.basename(TTS_VOICE_PATH)})")
+            tts_enabled = True
+        else:
+            print(" TTS語音輸出功能: 載入失敗，已禁用")
+            tts_enabled = False
+    else:
+        print(" TTS語音輸出功能: 未啟用")
+
+    print(" 系統默認使用語音輸入模式。")
+    print(" 特殊指令:")
+    print(" - 按 Enter 開始語音提問")
+    print(" - 輸入 'text' 或 't' 切換到文字輸入模式")
+    print(" - 輸入 'quit' 或 'exit' 來結束程式")
+    print(" - 輸入 'debug' 切換調試模式（顯示檢索詳情）")
+    print(" - 輸入 'help' 查看優化建議")
+    if tts_enabled:
+        print(" - 輸入 'tts' 手動播放上一次答案的語音")
     print("===================================")
 
     debug_mode = False  # 調試模式開關
-    text_mode = False   # 文字輸入模式開關
+    text_mode = False   # 文字模式開關，默認為False（語音模式）
+    last_answer = ""    # 保存上一次的答案，用於TTS重播
 
     while True:
         try:
             if ENABLE_VOICE_INPUT and not text_mode:
-                # 語音輸入模式（默認模式）
-                print("\n🎙️ 語音輸入模式")
-                command = input("🎤 按 Enter 開始錄音說話，或輸入指令 > ").strip()
+                # 默認語音輸入模式
+                print(f"\n{BOLD}=== 語音輸入模式 ==={RESET}")
+                command = input("按 Enter 開始語音提問，或輸入指令 > ")
                 
-                # 處理特殊指令
+                # 處理特殊命令
                 if command.lower() in ['quit', 'exit']:
                     break
                 elif command.lower() == 'debug':
@@ -1626,59 +1096,81 @@ if __name__ == "__main__":
                 elif command.lower() in ['text', 't']:
                     text_mode = True
                     print("已切換到文字輸入模式")
-                    print("輸入 'voice' 或 'v' 可切換回語音模式")
                     continue
-                elif command:  # 如果輸入了其他文字，當作文字問題處理
-                    question = command
-                    detected_lang = "zh"  # 文字輸入默認中文
-                else:
-                    # 空輸入，進行語音輸入
-                    voice_result = process_voice_input(qa_chain)
-                    if voice_result == "exit":
-                        break
-                    elif voice_result is None:
-                        continue
+                elif tts_enabled and command.lower() == 'tts':
+                    if last_answer:
+                        print("正在重播上一次答案的語音...")
+                        text_to_speech(last_answer)
                     else:
-                        question, detected_lang = voice_result  # 獲取問題和檢測到的語言
-                        if isinstance(question, tuple):  # 如果返回的是元組
-                            question, detected_lang = question
-                        else:  # 如果只返回問題
-                            detected_lang = "zh"  # 默認中文
+                        print("沒有可播放的答案")
+                    continue
+                elif command.strip() != '':
+                    # 如果輸入了其他文字，當作文字問題處理
+                    question = command
+                else:
+                    # 空輸入，開始語音錄音
+                    print("開始語音錄音...")
+                    
+                    # 創建停止事件
+                    stop_event = threading.Event()
+                    
+                    # 創建錄音線程
+                    print(f"{BOLD}正在錄音...{RESET} (按下 Enter 停止)")
+                    record_thread = threading.Thread(target=record_audio, args=(stop_event,))
+                    record_thread.start()
+                    
+                    # 等待用戶按下Enter鍵停止錄音
+                    input("按下Enter鍵停止錄音...")
+                    stop_event.set()
+                    record_thread.join()
+                    
+                    # 語音轉文字，並獲取偵測到的語言
+                    question, detected_lang = speech_to_text()
+                    if not question:
+                        print("無法識別語音，請重試。")
+                        continue
+                        
+                    # 處理識別出的文字，檢查是否為退出命令
+                    if question.lower().strip() in ["退出", "結束", "exit", "quit"]:
+                        print("語音指令: 退出程式")
+                        print("正在結束程式...")
+                        break
+                    
+                    # 將 Whisper 偵測的語言代碼映射到我們支持的語言
+                    detected_language = map_whisper_language_to_supported(detected_lang)
+                    print(f"檢測到的語言: {detected_language} ({'中文' if detected_language == 'zh' else '英文'})")
             else:
                 # 文字輸入模式
-                print("\n📝 文字輸入模式")
-                question = input("請輸入您的問題 > ")
+                print(f"\n{BOLD}=== 文字輸入模式 ==={RESET}")
+                question = input("請輸入您的問題 (或輸入 'voice'/'v' 切換回語音模式" + 
+                                (", 'tts' 重播語音)" if tts_enabled else "") + " > ")
                 
+                # 處理特殊命令
                 if question.lower() in ['quit', 'exit']:
                     break
-                if question.lower() == 'debug':
+                elif question.lower() == 'debug':
                     debug_mode = not debug_mode
                     print(f"調試模式已{'開啟' if debug_mode else '關閉'}")
                     continue
-                if question.lower() == 'help':
+                elif question.lower() == 'help':
                     print_optimization_suggestions()
                     continue
-                if ENABLE_VOICE_INPUT and question.lower() in ['voice', 'v']:
+                elif ENABLE_VOICE_INPUT and question.lower() in ['voice', 'v']:
                     text_mode = False
                     print("已切換到語音輸入模式")
                     continue
-                
-                # 為文字輸入設置默認語言
-                detected_lang = "zh"  # 文字輸入默認中文
-                    
+                elif tts_enabled and question.lower() == 'tts':
+                    if last_answer:
+                        print("正在重播上一次答案的語音...")
+                        text_to_speech(last_answer)
+                    else:
+                        print("沒有可播放的答案")
+                    continue
+
             if not question.strip(): # 忽略空輸入
                 continue
 
             print(f"正在處理您的問題 (使用 {LLM_PROVIDER.upper()} LLM)...")
-            
-            # 新增：播放提示音
-            if ENABLE_VOICE_OUTPUT and ENABLE_PROMPT_AUDIO and not debug_mode:  # 非調試模式才播放提示音
-                # 根據檢測到的語言播放相應的提示音
-                tts_language = "zh"
-                if 'detected_lang' in locals() and detected_lang:
-                    tts_language = map_whisper_language_to_supported(detected_lang)
-                
-                play_prompt_audio(tts_language)
             
             # 如果開啟調試模式，先顯示檢索結果
             if debug_mode:
@@ -1796,18 +1288,13 @@ if __name__ == "__main__":
 
             print("\n答案：")
             print(answer)
-            
-            # 新增：語音播放答案
-            if ENABLE_VOICE_OUTPUT:
-                print("\n🔊 正在播放語音答案...")
-                # 根據Whisper檢測到的語言決定TTS語言
-                if 'detected_lang' in locals():
-                    tts_language = map_whisper_language_to_supported(detected_lang)
-                else:
-                    tts_language = "zh"  # 默認中文
-                
-                # 播放答案
-                text_to_speech(answer, tts_language)
+
+            # 保存答案供TTS使用並自動播放語音
+            if tts_enabled:
+                last_answer = answer
+                # 自動播放語音，不需要用戶確認
+                print("\n正在播放語音答案...")
+                text_to_speech(answer)
 
             # 可選：顯示來源文件資訊 (保持註解)
             if source_docs and not debug_mode:  # 非調試模式才顯示簡化版本
@@ -1830,14 +1317,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"處理問題時發生未預期的錯誤: {e}")
             print("請檢查輸入、LLM 狀態或程式邏輯。")
-
-    # 清理臨時音頻文件
-    if os.path.exists(WAVE_OUTPUT_FILENAME):
-        try:
-            os.remove(WAVE_OUTPUT_FILENAME)
-            print(f"已清理臨時音頻文件: {WAVE_OUTPUT_FILENAME}")
-        except Exception as e:
-            print(f"清理臨時音頻文件時發生錯誤: {e}")
 
     print("--- RAG 系統已關閉 ---")
 
