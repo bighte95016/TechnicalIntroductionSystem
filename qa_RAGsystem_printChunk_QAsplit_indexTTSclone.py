@@ -93,6 +93,9 @@ TTS_CONFIG_PATH = "./index_tts/checkpoints/config.yaml"  # TTS配置文件路徑
 TTS_VOICE_PATH = "./voice/Dr_Lee.wav"  # 語音參考文件路徑
 tts_system = None  # 全局變量，用於存儲TTS系統
 
+# --- 提示音功能設定 ---
+ENABLE_PROMPT_AUDIO = True  # 是否啟用提示音功能（在用戶提問後播放友好提示）
+
 # 檢查 Python 版本
 if sys.version_info < (3, 8):
     print("警告：您的 Python 版本較低，建議使用 Python 3.8 或更高版本以獲得最佳相容性。")
@@ -620,7 +623,7 @@ def initialize_llm():
 
 # --- 5. 建立 QA 鏈 (使用 RetrievalQA，支援混合檢索) ---
 def create_qa_chain(llm, vectorstore, texts=None):
-    """建立問答鏈，支援混合檢索"""
+    """建立問答鏈，支援混合檢索和多語言回復"""
     print("正在建立 QA 鏈...")
     try:
         # 建立Dense檢索器(向量搜索)
@@ -654,8 +657,8 @@ def create_qa_chain(llm, vectorstore, texts=None):
             print("使用純Dense檢索模式")
             retriever = dense_retriever
         
-        # 優化 Prompt 模板 - 支援分離的問答格式
-        template = """你是一個專業的全景抬頭式顯示器(P-HUD)技術專家。請根據以下提供的問答對簡短回答用戶問題。
+        # 多語言 Prompt 模板
+        chinese_template = """你是一個專業的全景抬頭式顯示器(P-HUD)技術專家。請根據以下提供的問答對簡短回答用戶問題。
 
 說明：以下每個項目包含一個相關問題和對應答案。請基於這些資訊回答用戶的問題。
 
@@ -664,7 +667,8 @@ def create_qa_chain(llm, vectorstore, texts=None):
 2. 不要使用任何特殊符號如星號、破折號、項目符號等
 3. 直接回答重點，避免冗長說明
 4. 優先使用完全匹配或最相關的問答對來回答
-5. 如果找到相關的問答對就基於其答案回答，沒有相關資訊才說超出文檔範疇
+5. 如果找到相關的問答對就基於其答案回答，沒有相關資訊才說"您的問題不在我的回答範疇，請詢問一旁的專家"
+6. 必須使用繁體中文回答
 
 相關問答對：
 {context}
@@ -672,8 +676,25 @@ def create_qa_chain(llm, vectorstore, texts=None):
 用戶問題：{question}
 
 簡短回答："""
-        
-        QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
+
+        english_template = """You are a professional P-HUD (Panoramic Head-Up Display) technical expert. Please answer user questions concisely based on the provided Q&A pairs.
+
+Instructions: Each item below contains a relevant question and corresponding answer. Please base your response on this information.
+
+Requirements:
+1. Keep answers concise and clear, no more than 3 sentences
+2. Do not use special symbols like asterisks, dashes, or bullet points
+3. Answer directly to the point, avoid lengthy explanations
+4. Prioritize using exactly matching or most relevant Q&A pairs for answers
+5. If relevant Q&A pairs are found, base your answer on them. Only say "Your question is beyond my scope of knowledge, please consult the expert nearby" if no relevant information is found
+6. Must answer in English
+
+Relevant Q&A pairs:
+{context}
+
+User question: {question}
+
+Concise answer:"""
         
         # 自定義文檔格式化函數
         def format_docs(docs):
@@ -689,44 +710,59 @@ def create_qa_chain(llm, vectorstore, texts=None):
                     formatted_parts.append(f"文檔{i}：\n{doc.page_content}")
             return "\n\n".join(formatted_parts)
         
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=retriever,
-            chain_type="stuff", # 使用 Stuff 方法
-            return_source_documents=True,
-            chain_type_kwargs={
-                "prompt": QA_CHAIN_PROMPT,
-                "document_variable_name": "context"
-            }
-        )
+        def format_docs_english(docs):
+            formatted_parts = []
+            for i, doc in enumerate(docs, 1):
+                # 檢查是否為分離的問答格式
+                if doc.metadata.get('type') == 'qa_separated':
+                    question = doc.page_content
+                    answer = doc.metadata.get('answer', 'Answer not found')
+                    formatted_parts.append(f"Q&A Pair {i}:\nQuestion: {question}\nAnswer: {answer}")
+                else:
+                    # 原始格式
+                    formatted_parts.append(f"Document {i}:\n{doc.page_content}")
+            return "\n\n".join(formatted_parts)
         
-        # 包裝QA鏈以使用自定義格式化
-        class CustomQAChain:
-            def __init__(self, qa_chain, format_func):
-                self.qa_chain = qa_chain
-                self.format_func = format_func
+        # 包裝QA鏈以支持多語言
+        class MultilingualQAChain:
+            def __init__(self, llm, retriever, chinese_template, english_template, format_func_zh, format_func_en):
+                self.llm = llm
+                self.retriever = retriever
+                self.chinese_prompt = PromptTemplate.from_template(chinese_template)
+                self.english_prompt = PromptTemplate.from_template(english_template)
+                self.format_func_zh = format_func_zh
+                self.format_func_en = format_func_en
             
             def invoke(self, inputs):
-                # 先獲取檢索結果
+                # 獲取查詢和語言參數
                 query = inputs["query"]
-                docs = retriever.get_relevant_documents(query)
+                language = inputs.get("language", "zh")  # 默認中文
                 
-                # 格式化文檔
-                formatted_context = self.format_func(docs)
+                # 檢索相關文檔
+                docs = self.retriever.get_relevant_documents(query)
                 
-                # 直接調用LLM
-                prompt_text = QA_CHAIN_PROMPT.format(context=formatted_context, question=query)
-                answer = llm.invoke(prompt_text)
+                # 根據語言選擇格式化函數和提示模板
+                if language == "en":
+                    formatted_context = self.format_func_en(docs)
+                    prompt_text = self.english_prompt.format(context=formatted_context, question=query)
+                else:
+                    formatted_context = self.format_func_zh(docs)
+                    prompt_text = self.chinese_prompt.format(context=formatted_context, question=query)
+                
+                # 調用LLM
+                answer = self.llm.invoke(prompt_text)
                 
                 return {
                     "result": answer,
                     "source_documents": docs
                 }
         
-        wrapped_qa_chain = CustomQAChain(qa_chain, format_docs)
+        multilingual_qa_chain = MultilingualQAChain(
+            llm, retriever, chinese_template, english_template, format_docs, format_docs_english
+        )
         
-        print("QA 鏈建立成功。")
-        return wrapped_qa_chain
+        print("多語言QA鏈建立成功。")
+        return multilingual_qa_chain
     except Exception as e:
         print(f"建立 QA 鏈時發生錯誤: {e}")
         return None
@@ -958,6 +994,65 @@ def create_bm25_retriever(texts, cache_dir=BM25_CACHE_DIR):
         print(f"建立BM25檢索器時發生錯誤: {e}")
         return None
 
+def play_prompt_audio(detected_language="zh"):
+    """播放提示音，在用戶提問後、系統開始思考時播放（IndexTTS版本）
+    
+    Args:
+        detected_language: 檢測到的語言 ('zh' 或 'en')
+    """
+    if not ENABLE_PROMPT_AUDIO or not ENABLE_TTS_OUTPUT:
+        return
+    
+    # 檢查語音參考文件是否存在
+    if not os.path.exists(TTS_VOICE_PATH):
+        print("⚠️ 語音參考文件不存在，無法播放提示音")
+        return
+    
+    # 創建一個非阻塞的提示音播放函數
+    def play_prompt_in_background():
+        try:
+            # 載入TTS系統
+            if not load_tts_system():
+                print("⚠️ TTS系統載入失敗，無法播放提示音")
+                return
+            
+            # 根據檢測到的語言選擇提示音文本
+            if detected_language == "en":
+                # 英文提示音
+                prompt_text = "Thank you for your question. Let me think about it and get back to you shortly."
+                prompt_lang = "English"
+            else:
+                # 中文提示音
+                prompt_text = "感謝您的提問，我思考一下，請稍後。"
+                prompt_lang = "中文"
+            
+            print(f"🎵 播放提示音 ({prompt_lang})...")
+            
+            # 生成並播放提示音
+            sampling_rate, wav_data = tts_system.infer(
+                TTS_VOICE_PATH, 
+                prompt_text, 
+                output_path=None  # 不保存到文件
+            )
+            
+            # 播放提示音
+            sd.play(wav_data, sampling_rate)
+            sd.wait()  # 等待播放完成
+            
+            print("✅ 提示音播放完成")
+            
+        except Exception as e:
+            print(f"❌ 播放提示音時發生錯誤: {e}")
+    
+    # 在後台線程中播放提示音，避免阻塞主程序
+    try:
+        import threading
+        prompt_thread = threading.Thread(target=play_prompt_in_background)
+        prompt_thread.daemon = True  # 設為守護線程
+        prompt_thread.start()
+    except Exception as e:
+        print(f"⚠️ 啟動提示音線程時發生錯誤: {e}")
+
 # --- 主要執行流程 ---
 if __name__ == "__main__":
     # --- 步驟 0: 清理舊的向量儲存和BM25快取 ---
@@ -1044,6 +1139,7 @@ if __name__ == "__main__":
         print("預載入語音識別模型（可能需要一些時間）...")
         load_whisper_model()
         print(f" 語音輸入功能: 已啟用 (Whisper模型: {WHISPER_MODEL_SIZE})")
+        print("    🌐 多語言支持：檢測到英文時將以英文回復，檢測到中文時以中文回復")
     else:
         print(" 語音輸入功能: 未啟用")
 
@@ -1054,6 +1150,8 @@ if __name__ == "__main__":
         print("預載入TTS語音合成系統（可能需要一些時間）...")
         if load_tts_system():
             print(f" TTS語音輸出功能: 已啟用 (語音: {os.path.basename(TTS_VOICE_PATH)})")
+            if ENABLE_PROMPT_AUDIO:
+                print("    🎵 提示音功能已啟用（問題處理時播放友好提示）")
             tts_enabled = True
         else:
             print(" TTS語音輸出功能: 載入失敗，已禁用")
@@ -1170,7 +1268,19 @@ if __name__ == "__main__":
             if not question.strip(): # 忽略空輸入
                 continue
 
+            # 確定語言（用於提示音和TTS）
+            if ENABLE_VOICE_INPUT and not text_mode and 'detected_language' in locals():
+                # 語音模式且有檢測到的語言
+                tts_language = detected_language
+            else:
+                # 文字模式，使用默認中文
+                tts_language = "zh"
+
             print(f"正在處理您的問題 (使用 {LLM_PROVIDER.upper()} LLM)...")
+            
+            # 新增：播放提示音
+            if tts_enabled and ENABLE_PROMPT_AUDIO and not debug_mode:  # 非調試模式才播放提示音
+                play_prompt_audio(tts_language)
             
             # 如果開啟調試模式，先顯示檢索結果
             if debug_mode:
@@ -1198,9 +1308,9 @@ if __name__ == "__main__":
                             
                             if chunk_type == 'qa_separated':
                                 # 分離的問答格式
-                                question = doc.page_content
+                                doc_question = doc.page_content
                                 answer = doc.metadata.get('answer', '答案未找到')
-                                print(f"      問題: {question[:50]}{'...' if len(question) > 50 else ''}")
+                                print(f"      問題: {doc_question[:50]}{'...' if len(doc_question) > 50 else ''}")
                                 print(f"      答案: {answer[:50]}{'...' if len(answer) > 50 else ''}")
                             else:
                                 # 原始格式
@@ -1230,9 +1340,9 @@ if __name__ == "__main__":
                                     
                                     if chunk_type == 'qa_separated':
                                         # 分離的問答格式
-                                        question = doc.page_content
+                                        doc_question = doc.page_content
                                         answer = doc.metadata.get('answer', '答案未找到')
-                                        print(f"      問題: {question[:50]}{'...' if len(question) > 50 else ''}")
+                                        print(f"      問題: {doc_question[:50]}{'...' if len(doc_question) > 50 else ''}")
                                         print(f"      答案: {answer[:50]}{'...' if len(answer) > 50 else ''}")
                                     else:
                                         # 原始格式
@@ -1265,9 +1375,9 @@ if __name__ == "__main__":
                             
                             if chunk_type == 'qa_separated':
                                 # 分離的問答格式
-                                question_text = doc.page_content
+                                doc_question = doc.page_content
                                 answer = doc.metadata.get('answer', '答案未找到')
-                                print(f"    問題: {question_text[:100]}{'...' if len(question_text) > 100 else ''}")
+                                print(f"    問題: {doc_question[:100]}{'...' if len(doc_question) > 100 else ''}")
                                 print(f"    答案: {answer[:100]}{'...' if len(answer) > 100 else ''}")
                             else:
                                 # 原始格式
@@ -1280,8 +1390,8 @@ if __name__ == "__main__":
                 
                 print("=" * 40)
             
-            # <-- 直接調用 qa_chain.invoke
-            result = qa_chain.invoke({"query": question})
+            # <-- 直接調用 qa_chain.invoke，傳遞語言參數
+            result = qa_chain.invoke({"query": question, "language": tts_language})
             # <-- 從結果中提取 'result'
             answer = result.get('result', '抱歉，無法生成答案。').strip()
             source_docs = result.get('source_documents', []) # 獲取來源文檔 (可選)

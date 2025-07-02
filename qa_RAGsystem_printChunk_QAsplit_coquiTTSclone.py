@@ -43,6 +43,10 @@ import soundfile as sf             # 音頻文件處理 (新增)
 import tempfile
 from pathlib import Path
 
+# 新增：文字語言檢測功能
+# import langdetect  # 移除langdetect依賴
+# from langdetect import detect  # 移除langdetect依賴
+
 # --- 在所有 import 之後，第一次訪問環境變數之前調用 load_dotenv --- #
 load_dotenv()
 
@@ -405,8 +409,8 @@ def initialize_llm():
 
 # --- 5. 建立 QA 鏈 (使用 RetrievalQA，支援混合檢索) ---
 def create_qa_chain(llm, vectorstore, texts=None):
-    """建立問答鏈，支援混合檢索"""
-    print("正在建立 QA 鏈...")
+    """建立問答鏈，支援混合檢索和多語言回覆"""
+    print("正在建立多語言 QA 鏈...")
     try:
         # 建立Dense檢索器(向量搜索)
         dense_retriever = vectorstore.as_retriever(
@@ -439,8 +443,8 @@ def create_qa_chain(llm, vectorstore, texts=None):
             print("使用純Dense檢索模式")
             retriever = dense_retriever
         
-        # 優化 Prompt 模板 - 支援分離的問答格式
-        template = """你是一個專業的全景抬頭式顯示器(P-HUD)技術專家。請根據以下提供的問答對簡短回答用戶問題。
+        # 多語言 Prompt 模板 - 支援分離的問答格式
+        template_zh = """你是一個專業的全景抬頭式顯示器(P-HUD)技術專家。請根據以下提供的問答對簡短回答用戶問題。
 
 說明：以下每個項目包含一個相關問題和對應答案。請基於這些資訊回答用戶的問題。
 
@@ -450,15 +454,37 @@ def create_qa_chain(llm, vectorstore, texts=None):
 3. 直接回答重點，避免冗長說明
 4. 優先使用完全匹配或最相關的問答對來回答
 5. 如果找到相關的問答對就基於其答案回答，沒有相關資訊才說超出文檔範疇
+6. 必須使用繁體中文回答，P-HUD改成全景抬頭式顯示器，HUD改成抬頭式顯示器，AR改成擴增實境
 
 相關問答對：
 {context}
 
 用戶問題：{question}
 
-簡短回答："""
+繁體中文簡短回答："""
+
+        template_en = """You are a professional P-HUD (Panoramic Head-Up Display) technical expert. Please provide a brief answer to the user's question based on the following Q&A pairs.
+
+Instructions: Each item below contains a relevant question and corresponding answer. Please base your response on this information.
+
+Requirements:
+1. Answer should be concise and clear, no more than 3 sentences
+2. Do not use any special symbols like asterisks, dashes, bullet points, etc.
+3. Answer directly to the point, avoid lengthy explanations
+4. Prioritize using exact matches or most relevant Q&A pairs to answer
+5. If you find relevant Q&A pairs, base your answer on them; only say it's beyond the document scope if no relevant information is found
+6. Must answer in English
+
+Relevant Q&A pairs:
+{context}
+
+User question: {question}
+
+Brief English answer:"""
         
-        QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
+        # 創建兩種語言的提示模板
+        ZH_CHAIN_PROMPT = PromptTemplate.from_template(template_zh)
+        EN_CHAIN_PROMPT = PromptTemplate.from_template(template_en)
         
         # 自定義文檔格式化函數
         def format_docs(docs):
@@ -474,43 +500,74 @@ def create_qa_chain(llm, vectorstore, texts=None):
                     formatted_parts.append(f"文檔{i}：\n{doc.page_content}")
             return "\n\n".join(formatted_parts)
         
-        qa_chain = RetrievalQA.from_chain_type(
+        # 創建多語言QA鏈
+        qa_chains = {}
+        
+        # 中文QA鏈
+        qa_chains["zh"] = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=retriever,
             chain_type="stuff", # 使用 Stuff 方法
             return_source_documents=True,
             chain_type_kwargs={
-                "prompt": QA_CHAIN_PROMPT,
+                "prompt": ZH_CHAIN_PROMPT,
+                "document_variable_name": "context"
+            }
+        )
+        
+        # 英文QA鏈
+        qa_chains["en"] = RetrievalQA.from_chain_type(
+            llm=llm,
+            retriever=retriever,
+            chain_type="stuff", # 使用 Stuff 方法
+            return_source_documents=True,
+            chain_type_kwargs={
+                "prompt": EN_CHAIN_PROMPT,
                 "document_variable_name": "context"
             }
         )
         
         # 包裝QA鏈以使用自定義格式化
-        class CustomQAChain:
-            def __init__(self, qa_chain, format_func):
-                self.qa_chain = qa_chain
+        class MultiLanguageQAChain:
+            def __init__(self, qa_chains, format_func, retriever):
+                self.qa_chains = qa_chains
                 self.format_func = format_func
+                self.retriever = retriever
             
             def invoke(self, inputs):
-                # 先獲取檢索結果
                 query = inputs["query"]
-                docs = retriever.get_relevant_documents(query)
+                language = inputs.get("language", "zh")  # 默認中文
+                print(f"🔍 調試信息: QA鏈接收到的語言參數 = '{language}'")
+                
+                # 選擇對應語言的QA鏈
+                qa_chain = self.qa_chains.get(language, self.qa_chains["zh"])
+                print(f"🔍 調試信息: 選擇的QA鏈語言 = '{language}' (可用鏈: {list(self.qa_chains.keys())})")
+                
+                # 先獲取檢索結果
+                docs = self.retriever.get_relevant_documents(query)
                 
                 # 格式化文檔
                 formatted_context = self.format_func(docs)
                 
-                # 直接調用LLM
-                prompt_text = QA_CHAIN_PROMPT.format(context=formatted_context, question=query)
+                # 直接調用對應語言的QA鏈
+                if language == "zh":
+                    print(f"🔍 調試信息: 使用中文Prompt模板")
+                    prompt_text = ZH_CHAIN_PROMPT.format(context=formatted_context, question=query)
+                else:
+                    print(f"🔍 調試信息: 使用英文Prompt模板")
+                    prompt_text = EN_CHAIN_PROMPT.format(context=formatted_context, question=query)
+                
                 answer = llm.invoke(prompt_text)
                 
                 return {
                     "result": answer,
-                    "source_documents": docs
+                    "source_documents": docs,
+                    "language": language
                 }
         
-        wrapped_qa_chain = CustomQAChain(qa_chain, format_docs)
+        wrapped_qa_chain = MultiLanguageQAChain(qa_chains, format_docs, retriever)
         
-        print("QA 鏈建立成功。")
+        print("多語言 QA 鏈建立成功。")
         return wrapped_qa_chain
     except Exception as e:
         print(f"建立 QA 鏈時發生錯誤: {e}")
@@ -901,6 +958,8 @@ def speech_to_text():
         # 根據檢測到的語言顯示不同的 emoji
         lang_emoji = "🇨🇳" if detected_language in ["zh", "cn"] else "🇺🇸" if detected_language == "en" else "🌐"
         print(f"{lang_emoji} 語音識別完成 ({detected_language})")
+        print(f"🔍 調試信息: Whisper檢測到的語言 = '{detected_language}'")
+        print(f"🔍 調試信息: 識別到的文字 = '{text}'")
         
         return text, detected_language
     
@@ -912,12 +971,59 @@ def speech_to_text():
 
 def map_whisper_language_to_supported(detected_lang):
     """將 Whisper 檢測的語言代碼映射到我們支持的語言"""
+    if not detected_lang:
+        return "zh"  # 空值或None返回默認中文
+    
+    # 轉換為小寫以支持大小寫不敏感的比較
+    detected_lang_lower = str(detected_lang).lower().strip()
+    
     lang_map = {
-        "zh": "zh", "cn": "zh", "ja": "zh", "ko": "zh",  # 亞洲語言使用中文回答
-        "en": "en", "fr": "en", "de": "en", "es": "en", "my": "en",  # 西方語言使用英文回答
+        # 英文的各種可能表示
+        "en": "en", "eng": "en", "english": "en", "en-us": "en", "en-gb": "en",
+        # 中文的各種可能表示  
+        "zh": "zh", "cn": "zh", "chi": "zh", "chinese": "zh", "zh-cn": "zh", "zh-tw": "zh",
+        "mandarin": "zh", "cantonese": "zh",
+        # 其他亞洲語言使用中文回答
+        "ja": "zh", "jp": "zh", "japanese": "zh",
+        "ko": "zh", "kr": "zh", "korean": "zh",
+        # 其他西方語言使用英文回答
+        "fr": "en", "french": "en", "fra": "en",
+        "de": "en", "german": "en", "deu": "en",
+        "es": "en", "spanish": "en", "esp": "en",
+        "my": "en", "malay": "en",
+        "it": "en", "italian": "en",
+        "pt": "en", "portuguese": "en",
     }
     # 默認使用中文回答
-    return lang_map.get(detected_lang, "zh")
+    mapped_lang = lang_map.get(detected_lang_lower, "zh")
+    print(f"🔍 調試信息: 語言映射 '{detected_lang}' -> '{mapped_lang}'")
+    return mapped_lang
+
+def detect_text_language(text):
+    """檢測文字語言（用於文字輸入）- 簡化版本，不依賴langdetect"""
+    try:
+        # 簡單的字符檢測規則
+        # 檢查是否包含中文字符（包括繁體和簡體）
+        chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
+        total_chars = len([char for char in text if char.isalpha()])
+        
+        if total_chars == 0:
+            return 'zh'  # 默認中文
+        
+        # 如果中文字符超過30%，判斷為中文
+        chinese_ratio = chinese_chars / total_chars
+        if chinese_ratio > 0.3:
+            return 'zh'
+        else:
+            return 'en'
+            
+    except Exception as e:
+        print(f"⚠️ 文字語言檢測出錯: {e}")
+        # 如果檢測失敗，使用更簡單的規則
+        if any('\u4e00' <= char <= '\u9fff' for char in text):
+            return 'zh'
+        else:
+            return 'en'
 
 def process_voice_input(qa_chain):
     """處理語音輸入的完整流程"""
@@ -1452,6 +1558,12 @@ if __name__ == "__main__":
     if USE_HYBRID_RETRIEVAL:
         print(f" 權重配置: Dense={DENSE_WEIGHT}, BM25={SPARSE_WEIGHT}")
     
+    # 語言檢測機制說明
+    print(f" 🌐 語言檢測機制:")
+    if ENABLE_VOICE_INPUT:
+        print(f"    🎙️ 語音輸入: 使用Whisper自動檢測語言")
+    print(f"    📝 文字輸入: 基於中文字符比例檢測 (>30%為中文)")
+    
     if ENABLE_VOICE_INPUT:
         print(" 🎙️ 語音輸入模式已啟用（主要模式）")
         print(" 🎯 語音輸入流程：")
@@ -1505,7 +1617,8 @@ if __name__ == "__main__":
                     continue
                 elif command:  # 如果輸入了其他文字，當作文字問題處理
                     question = command
-                    detected_lang = "zh"  # 文字輸入默認中文
+                    detected_lang = detect_text_language(command)  # 檢測文字語言
+                    print(f"🔍 調試信息: 文字語言檢測結果 = '{detected_lang}' (基於字符分析)")
                 else:
                     # 空輸入，進行語音輸入
                     voice_result = process_voice_input(qa_chain)
@@ -1514,11 +1627,15 @@ if __name__ == "__main__":
                     elif voice_result is None:
                         continue
                     else:
-                        question, detected_lang = voice_result  # 獲取問題和檢測到的語言
-                        if isinstance(question, tuple):  # 如果返回的是元組
-                            question, detected_lang = question
-                        else:  # 如果只返回問題
-                            detected_lang = "zh"  # 默認中文
+                        # 修復語音結果處理邏輯
+                        if isinstance(voice_result, tuple) and len(voice_result) == 2:
+                            question, detected_lang = voice_result
+                            print(f"🔍 調試信息: 使用Whisper檢測的語言 = '{detected_lang}' (語音識別)")
+                        else:
+                            # 如果只返回問題字符串，使用默認中文
+                            question = voice_result
+                            detected_lang = "zh"
+                            print(f"🔍 調試信息: 語音輸入但未檢測到語言，使用默認 = '{detected_lang}'")
             else:
                 # 文字輸入模式
                 print("\n📝 文字輸入模式")
@@ -1538,21 +1655,23 @@ if __name__ == "__main__":
                     print("已切換到語音輸入模式")
                     continue
                 
-                # 為文字輸入設置默認語言
-                detected_lang = "zh"  # 文字輸入默認中文
+                # 檢測文字輸入的語言
+                detected_lang = detect_text_language(question)
+                print(f"🔍 調試信息: 文字語言檢測結果 = '{detected_lang}' (基於字符分析)")
                     
             if not question.strip(): # 忽略空輸入
                 continue
 
-            print(f"正在處理您的問題 (使用 {LLM_PROVIDER.upper()} LLM)...")
+            # 顯示檢測到的語言
+            lang_display = "中文" if detected_lang == "zh" else "English"
+            print(f"正在處理您的問題 (檢測語言: {lang_display}, 使用 {LLM_PROVIDER.upper()} LLM)...")
+            print(f"🔍 調試信息: 原始檢測語言代碼 = '{detected_lang}'")
             
             # 新增：播放提示音
             if ENABLE_VOICE_OUTPUT and ENABLE_PROMPT_AUDIO and not debug_mode:  # 非調試模式才播放提示音
                 # 根據檢測到的語言播放相應的提示音
-                tts_language = "zh"
-                if 'detected_lang' in locals() and detected_lang:
-                    tts_language = map_whisper_language_to_supported(detected_lang)
-                
+                tts_language = map_whisper_language_to_supported(detected_lang)
+                print(f"🔍 調試信息: 提示音使用語言 = '{tts_language}'")
                 play_prompt_audio(tts_language)
             
             # 如果開啟調試模式，先顯示檢索結果
@@ -1581,9 +1700,9 @@ if __name__ == "__main__":
                             
                             if chunk_type == 'qa_separated':
                                 # 分離的問答格式
-                                question = doc.page_content
+                                question_content = doc.page_content
                                 answer = doc.metadata.get('answer', '答案未找到')
-                                print(f"      問題: {question[:50]}{'...' if len(question) > 50 else ''}")
+                                print(f"      問題: {question_content[:50]}{'...' if len(question_content) > 50 else ''}")
                                 print(f"      答案: {answer[:50]}{'...' if len(answer) > 50 else ''}")
                             else:
                                 # 原始格式
@@ -1613,9 +1732,9 @@ if __name__ == "__main__":
                                     
                                     if chunk_type == 'qa_separated':
                                         # 分離的問答格式
-                                        question = doc.page_content
+                                        question_content = doc.page_content
                                         answer = doc.metadata.get('answer', '答案未找到')
-                                        print(f"      問題: {question[:50]}{'...' if len(question) > 50 else ''}")
+                                        print(f"      問題: {question_content[:50]}{'...' if len(question_content) > 50 else ''}")
                                         print(f"      答案: {answer[:50]}{'...' if len(answer) > 50 else ''}")
                                     else:
                                         # 原始格式
@@ -1663,23 +1782,24 @@ if __name__ == "__main__":
                 
                 print("=" * 40)
             
-            # <-- 直接調用 qa_chain.invoke
-            result = qa_chain.invoke({"query": question})
-            # <-- 從結果中提取 'result'
+            # 調用多語言QA鏈，傳入語言參數
+            print(f"🔍 調試信息: 傳入QA鏈的語言參數 = '{detected_lang}'")
+            result = qa_chain.invoke({"query": question, "language": detected_lang})
+            # 從結果中提取信息
             answer = result.get('result', '抱歉，無法生成答案。').strip()
             source_docs = result.get('source_documents', []) # 獲取來源文檔 (可選)
+            response_lang = result.get('language', detected_lang)  # 獲取回覆語言
+            print(f"🔍 調試信息: QA鏈返回的語言 = '{response_lang}'")
 
-            print("\n答案：")
+            print(f"\n答案 ({lang_display})：")
             print(answer)
             
             # 新增：語音播放答案
             if ENABLE_VOICE_OUTPUT:
-                print("\n🔊 正在播放語音答案...")
-                # 根據Whisper檢測到的語言決定TTS語言
-                if 'detected_lang' in locals():
-                    tts_language = map_whisper_language_to_supported(detected_lang)
-                else:
-                    tts_language = "zh"  # 默認中文
+                print(f"\n🔊 正在播放語音答案 ({lang_display})...")
+                # 使用檢測到的語言進行TTS
+                tts_language = map_whisper_language_to_supported(detected_lang)
+                print(f"🔍 調試信息: TTS使用語言 = '{tts_language}'")
                 
                 # 播放答案
                 text_to_speech(answer, tts_language)
