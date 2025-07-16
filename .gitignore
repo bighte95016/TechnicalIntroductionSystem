@@ -1,2 +1,90 @@
-model/*.gguf
+# 打包相關文件
+build/
+dist/
+*.spec
+*.exe
+*.app
+*.dmg
+*.deb
+*.rpm
+
+# Python 相關
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 虛擬環境
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE 相關
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系統文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日誌文件
+*.log
+
+# 臨時文件
+*.tmp
+*.temp
+temp_recording.wav
+
+# 數據庫和緩存
+chroma_db/
+bm25_cache/
+tts_cache/
+*.db
+*.sqlite
+
+# 環境變量
 .env
+.env.local
+.env.*.local
+
+# 模型檔案（通常很大，不應該加入版本控制）
+*.bin
+*.pth
+*.pt
+*.onnx
+*.h5
+*.hdf5
+
+# 文檔生成
+docs/_build/
+site/
+
+# 測試相關
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# 個人檔案
+chunks_data.txt
+*.wav
+*.mp3
+*.mp4
+*.flac
+*.ogg
+
+gemma-3-12b-it-qat-q4_0-gguf/
+model/
+chroma_db_debug/
+chroma_db_test/

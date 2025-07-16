@@ -1,5 +1,9 @@
 import os
 import sys
+
+# 禁用 Chroma 遙測功能以避免錯誤
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaLLM
@@ -34,8 +38,15 @@ import sounddevice as sd
 # --- 在所有 import 之後，第一次訪問環境變數之前調用 load_dotenv --- #
 load_dotenv()
 
+# 【關鍵修正】將分詞器定義在頂層，使其可以被pickle序列化
+def jieba_tokenizer(text):
+    """
+    使用jieba進行分詞，並返回詞語列表，供BM25Retriever使用
+    """
+    return list(jieba.cut(text))
+
 # --- 基本設定 ---
-PDF_DIRECTORY = "./technical_file/PDF"
+PDF_DIRECTORY = "./bar_file/PDF"
 VECTORSTORE_DIR = "./chroma_db" # Chroma DB 持久化儲存目錄
 BM25_CACHE_DIR = "./bm25_cache" # BM25檢索器快取目錄
 
@@ -71,9 +82,9 @@ RESET = "\033[0m"
 
 # --- 混合檢索設定 ---
 USE_HYBRID_RETRIEVAL = True  # 是否使用混合檢索
-DENSE_WEIGHT = 0.5  # Dense retriever權重 (0.0-1.0)
-SPARSE_WEIGHT = 0.5  # BM25 retriever權重 (0.0-1.0)
-RETRIEVAL_K = 3  # 統一的檢索數量設定
+DENSE_WEIGHT = 0.4  # Dense retriever權重 (0.0-1.0) - 降低語義搜索權重
+SPARSE_WEIGHT = 0.6  # BM25 retriever權重 (0.0-1.0) - 提高關鍵詞匹配權重
+RETRIEVAL_K = 5  # 統一的檢索數量設定 - 增加到6個，確保BM25完美匹配不會被過濾
 SIMILARITY_THRESHOLD = 0.1  # 統一的相似度閾值設定 (0.0-1.0，越高越嚴格)
 
 # --- 問答分離設定 ---
@@ -86,7 +97,7 @@ ENABLE_VOICE_INPUT = True  # 是否啟用語音輸入功能
 ENABLE_TTS_OUTPUT = True  # 是否啟用TTS語音輸出功能
 TTS_MODEL_DIR = "./index_tts/checkpoints"  # TTS模型目錄
 TTS_CONFIG_PATH = "./index_tts/checkpoints/config.yaml"  # TTS配置文件路徑
-TTS_VOICE_PATH = "./voice/Dr_Lee.wav"  # 語音參考文件路徑
+TTS_VOICE_PATH = "./voice/Senior_Shiu.wav"  # 語音參考文件路徑
 tts_system = None  # 全局變量，用於存儲TTS系統
 
 # --- 提示音功能設定 ---
@@ -375,7 +386,24 @@ def load_pdf_by_paragraph(pdf_path: str):
 
         # 以行首 Qxx 切塊
         q_head = re.compile(r"\n\s*Q\s*\d+\s*[：:]", re.IGNORECASE)
-        starts = [m.start()+1 for m in q_head.finditer(full_text)] + [len(full_text)]
+        q_matches = list(q_head.finditer(full_text))
+        
+        # 詳細診斷輸出
+        print(f"  📊 診斷資訊：")
+        print(f"     - 原始文本長度: {len(full_text)} 字符")
+        print(f"     - 找到的Q標記數量: {len(q_matches)}")
+        
+        if q_matches:
+            print(f"     - Q標記位置和內容:")
+            for i, match in enumerate(q_matches[:10]):  # 只顯示前10個
+                start_pos = match.start()
+                end_pos = min(start_pos + 50, len(full_text))
+                context = full_text[start_pos:end_pos].replace('\n', '\\n')
+                print(f"       Q{i+1}: 位置{start_pos} -> \"{context}...\"")
+            if len(q_matches) > 10:
+                print(f"       ... 還有 {len(q_matches) - 10} 個Q標記")
+        
+        starts = [m.start()+1 for m in q_matches] + [len(full_text)]
         
         # 如果找到問題標記
         if starts and len(starts) > 1:
@@ -389,14 +417,26 @@ def load_pdf_by_paragraph(pdf_path: str):
             ]
             print(f"  ➜ 找到 {len(chunks)} 個 QA 組合")
             
+            # 統計分離成功/失敗的數量
+            successful_separations = 0
+            failed_separations = 0
+            filtered_out = 0
+            
             # 根據配置決定是否分離問題和答案
             docs = []
             for i, chunk in enumerate(chunks):
+                # 檢查chunk長度
+                if len(chunk.strip()) < 5:
+                    filtered_out += 1
+                    print(f"    Q{i+1}: 過短被過濾 (長度: {len(chunk.strip())})")
+                    continue
+                
                 if USE_QA_SEPARATION:
                     # 嘗試分離問題和答案
                     question, answer = separate_question_answer(chunk)
                     
                     if question and answer:
+                        successful_separations += 1
                         # 只將問題存入 page_content，答案存入 metadata
                         doc = Document(
                             page_content=question,  # 只存問題用於檢索
@@ -409,15 +449,19 @@ def load_pdf_by_paragraph(pdf_path: str):
                             }
                         )
                         docs.append(doc)
-                        print(f"    Q{i+1}: 問題({len(question)}字) + 答案({len(answer)}字)")
+                        print(f"    Q{i+1}: ✅ 分離成功 - 問題({len(question)}字) + 答案({len(answer)}字)")
                     else:
+                        failed_separations += 1
                         # 如果無法分離，退回到原始方式
                         doc = Document(
                             page_content=chunk,
                             metadata={**base_md, "paragraph_index": i, "type": "qa_pair"}
                         )
                         docs.append(doc)
-                        print(f"    Q{i+1}: 無法分離問答，使用原始格式")
+                        print(f"    Q{i+1}: ❌ 分離失敗，使用原始格式 (長度: {len(chunk)})")
+                        # 顯示無法分離的原因
+                        chunk_preview = chunk[:100].replace('\n', '\\n')
+                        print(f"           內容預覽: \"{chunk_preview}...\"")
                 else:
                     # 不分離，使用原始QA組合
                     doc = Document(
@@ -425,7 +469,18 @@ def load_pdf_by_paragraph(pdf_path: str):
                         metadata={**base_md, "paragraph_index": i, "type": "qa_pair"}
                     )
                     docs.append(doc)
-                    print(f"    Q{i+1}: 使用原始QA組合格式")
+                    print(f"    Q{i+1}: 使用原始QA組合格式 (長度: {len(chunk)})")
+            
+            # 統計摘要
+            print(f"  📈 處理統計：")
+            print(f"     - 原始Q標記數量: {len(q_matches)}")
+            print(f"     - 切分的chunk數量: {len(chunks)}")
+            print(f"     - 長度過濾掉: {filtered_out}")
+            if USE_QA_SEPARATION:
+                print(f"     - 問答分離成功: {successful_separations}")
+                print(f"     - 問答分離失敗: {failed_separations}")
+            print(f"     - 最終chunk數量: {len(docs)}")
+            
         else:
             # 退回到依雙換行切段（一般文件）
             print("  ➜ 未偵測到問題標記，依雙換行切分")
@@ -470,8 +525,11 @@ def separate_question_answer(qa_chunk: str):
                 # 清理答案：移除A標記，只保留答案內容
                 answer = re.sub(r'^(?:A\s*\d*\s*[：:]|答\s*[：:]|答案\s*[：:]|解答\s*[：:]|回答\s*[：:])\s*', '', answer, flags=re.IGNORECASE).strip()
                 
-                # 驗證分離結果
-                if len(question) > 5 and len(answer) > 10:  # 基本長度檢查
+                # 清理答案開頭的標記
+                answer = re.sub(r'^(?:A\s*\d*\s*[：:]|答\s*[：:]|答案\s*[：:])\s*', '', answer, flags=re.IGNORECASE).strip()
+                
+                # 驗證分離結果 - 統一長度檢查條件
+                if len(question) > 2 and len(answer) > 5:
                     return question, answer
         
         # 如果所有模式都失敗，嘗試簡單的按行分割
@@ -489,7 +547,8 @@ def separate_question_answer(qa_chunk: str):
             # 清理答案開頭的標記
             answer = re.sub(r'^(?:A\s*\d*\s*[：:]|答\s*[：:]|答案\s*[：:])\s*', '', answer, flags=re.IGNORECASE).strip()
             
-            if len(question) > 5 and len(answer) > 10:
+            # 統一長度檢查條件 - 修復Q58分離失敗問題
+            if len(question) > 2 and len(answer) > 5:
                 return question, answer
         
         return None, None
@@ -536,17 +595,44 @@ def split_documents(documents):
     """由於已在加載階段按段落分割，此函數只進行簡單處理"""
     print("文檔已在載入階段按段落分割，進行最終處理...")
     
+    # 統計變量
+    original_count = len(documents)
+    filtered_count = 0
+    
     # 進行簡單的過濾，例如去除過短的段落
     filtered_docs = []
-    for doc in documents:
-        # 過濾太短的段落（例如少於10個字符的）
-        if len(doc.page_content.strip()) < 10:
-            continue
+    for i, doc in enumerate(documents):
+        content_length = len(doc.page_content.strip())
+        
+        # 對於分離的問答格式，考慮問題和答案的總長度
+        if doc.metadata.get('type') == 'qa_separated':
+            answer = doc.metadata.get('answer', '')
+            total_length = content_length + len(answer)
+            # 對於問答格式，使用更寬鬆的過濾條件
+            if total_length < 8:  # 問題+答案總長度小於10才過濾
+                filtered_count += 1
+                print(f"  ⚠️  過濾第{i+1}個chunk (問題+答案總長度僅{total_length}字符): 問題=\"{doc.page_content.strip()[:20]}...\" 答案=\"{answer[:20]}...\"")
+                continue
+        else:
+            # 對於非問答格式，使用原來的過濾條件
+            if content_length < 3:
+                filtered_count += 1
+                print(f"  ⚠️  過濾第{i+1}個chunk (長度僅{content_length}字符): \"{doc.page_content.strip()[:30]}...\"")
+                continue
         
         # 保留有效段落
         filtered_docs.append(doc)
     
-    print(f"最終得到 {len(filtered_docs)} 個有效段落。")
+    # 詳細統計
+    print(f"  📊 最終過濾統計：")
+    print(f"     - 輸入chunk數量: {original_count}")
+    print(f"     - 因長度過短被過濾: {filtered_count}")
+    print(f"     - 最終保留chunk數量: {len(filtered_docs)}")
+    
+    if filtered_count > 0:
+        print(f"  💡 提示：有{filtered_count}個chunk因長度小於5字符被過濾")
+        print(f"     如需保留這些短chunk，可修改過濾條件")
+    
     return filtered_docs
 
 # --- 3. 建立向量儲存 ---
@@ -654,7 +740,7 @@ def create_qa_chain(llm, vectorstore, texts=None):
             retriever = dense_retriever
         
         # 多語言 Prompt 模板
-        chinese_template = """你是一個專業的全景抬頭式顯示器(P-HUD)技術專家。請根據以下提供的問答對簡短回答用戶問題。
+        chinese_template = """你是一個專業的robotic bar客服機器人。請根據以下提供的問答對回答用戶問題。
 
 說明：以下每個項目包含一個相關問題和對應答案。請基於這些資訊回答用戶的問題。
 
@@ -663,7 +749,7 @@ def create_qa_chain(llm, vectorstore, texts=None):
 2. 不要使用任何特殊符號如星號、破折號、項目符號等
 3. 直接回答重點，避免冗長說明
 4. 優先使用完全匹配或最相關的問答對來回答
-5. 如果找到相關的問答對就基於其答案回答，沒有相關資訊才說"您的問題不在我的回答範疇，請詢問一旁的專家"
+5. 如果找到相關的問答對就基於其答案回答，沒有相關資訊才說"您的問題不在我的回答範疇，請詢問櫃檯專員"
 6. 必須使用繁體中文回答
 
 相關問答對：
@@ -673,7 +759,7 @@ def create_qa_chain(llm, vectorstore, texts=None):
 
 簡短回答："""
 
-        english_template = """You are a professional P-HUD (Panoramic Head-Up Display) technical expert. Please answer user questions concisely based on the provided Q&A pairs.
+        english_template = """You are a professional robotic bar customer service robot. Please answer user questions based on the provided Q&A pairs below.
 
 Instructions: Each item below contains a relevant question and corresponding answer. Please base your response on this information.
 
@@ -682,7 +768,7 @@ Requirements:
 2. Do not use special symbols like asterisks, dashes, or bullet points
 3. Answer directly to the point, avoid lengthy explanations
 4. Prioritize using exactly matching or most relevant Q&A pairs for answers
-5. If relevant Q&A pairs are found, base your answer on them. Only say "Your question is beyond my scope of knowledge, please consult the expert nearby" if no relevant information is found
+5. If relevant Q&A pairs are found, base your answer on them. Only say "Your question is beyond my scope of knowledge, please consult the counter staff" if no relevant information is found
 6. Must answer in English
 
 Relevant Q&A pairs:
@@ -734,8 +820,11 @@ Concise answer:"""
                 query = inputs["query"]
                 language = inputs.get("language", "zh")  # 默認中文
                 
+                # 標準化查詢中的標點符號，提高檢索精度
+                normalized_query = normalize_punctuation(query)
+                
                 # 檢索相關文檔
-                docs = self.retriever.get_relevant_documents(query)
+                docs = self.retriever.get_relevant_documents(normalized_query)
                 
                 # 根據語言選擇格式化函數和提示模板
                 if language == "en":
@@ -881,7 +970,7 @@ def print_optimization_suggestions():
 
 1. 調整相似度閾值：
    目前設定 {SIMILARITY_THRESHOLD} 較嚴格
-   建議嘗試 0.1-0.2 較寬松
+   建議嘗試 0.1-0.2 較寬鬆
    在檔案頂部修改 SIMILARITY_THRESHOLD 參數
 
 2. 增加檢索數量：
@@ -936,12 +1025,16 @@ def create_bm25_retriever(texts, cache_dir=BM25_CACHE_DIR):
     os.makedirs(cache_dir, exist_ok=True)
     bm25_cache_file = os.path.join(cache_dir, "bm25_retriever.pkl")
     
+    # 【注意】由於我們修改了BM25的創建邏輯，即使快取存在也可能需要重建。
+    # 這裡的邏輯保持不變，但主程序啟動時會刪除舊快取，確保新邏輯生效。
     try:
         # 嘗試載入快取的BM25檢索器
         if os.path.exists(bm25_cache_file):
             print("載入快取的BM25檢索器...")
             with open(bm25_cache_file, 'rb') as f:
                 bm25_retriever = pickle.load(f)
+            # 確保k值與當前設置一致
+            bm25_retriever.k = RETRIEVAL_K
             print("BM25檢索器載入成功")
             return bm25_retriever
     except Exception as e:
@@ -949,33 +1042,28 @@ def create_bm25_retriever(texts, cache_dir=BM25_CACHE_DIR):
     
     # 建立新的BM25檢索器
     try:
-        # 為中文文本進行分詞預處理
-        def preprocess_text(text):
-            """中文文本預處理：分詞"""
-            # 使用jieba進行中文分詞
-            words = jieba.cut(text)
-            return " ".join(words)
-        
-        # 預處理所有文檔
-        print("正在進行中文分詞預處理...")
-        processed_texts = []
+        # 準備用於BM25的文檔，只包含需要被索引的內容。
+        # 這樣做可以確保元數據與原始文檔完全一致。
+        bm25_docs = []
         for doc in texts:
-            # 對於分離的問答格式，只對問題部分進行BM25檢索
+            # 對於分離的問答格式，只對問題部分進行BM25索引
             if doc.metadata.get('type') == 'qa_separated':
-                # 只處理問題部分，保持原有的metadata結構
-                processed_content = preprocess_text(doc.page_content)  # doc.page_content已經是問題
+                content_to_index = doc.page_content  # page_content 已經是問題
             else:
-                # 原始格式，處理完整內容
-                processed_content = preprocess_text(doc.page_content)
+                content_to_index = doc.page_content
             
-            processed_doc = Document(
-                page_content=processed_content,
-                metadata=doc.metadata
-            )
-            processed_texts.append(processed_doc)
-        
-        # 建立BM25檢索器
-        bm25_retriever = BM25Retriever.from_documents(processed_texts)
+            # 創建一個新的Document對象，只包含要索引的文本和原始元數據
+            # 這樣可以避免對答案或其他元數據字段進行不必要的分詞和索引
+            bm25_doc = Document(page_content=content_to_index, metadata=doc.metadata)
+            bm25_docs.append(bm25_doc)
+
+        print("正在使用jieba分詞器建立BM25檢索器...")
+        # 【關鍵修正】直接傳入原始文檔和分詞函數。
+        # from_documents會自動對文檔內容和後續的所有查詢應用此函數。
+        bm25_retriever = BM25Retriever.from_documents(
+            documents=bm25_docs,
+            preprocess_func=jieba_tokenizer
+        )
         bm25_retriever.k = RETRIEVAL_K  # 使用統一的檢索數量設定
         
         # 儲存到快取
@@ -983,7 +1071,7 @@ def create_bm25_retriever(texts, cache_dir=BM25_CACHE_DIR):
         with open(bm25_cache_file, 'wb') as f:
             pickle.dump(bm25_retriever, f)
         
-        print("BM25檢索器建立成功（已適配分離問答格式）")
+        print("BM25檢索器建立成功（已內置jieba分詞功能）")
         return bm25_retriever
         
     except Exception as e:
@@ -1048,6 +1136,37 @@ def play_prompt_audio(detected_language="zh"):
         prompt_thread.start()
     except Exception as e:
         print(f"⚠️ 啟動提示音線程時發生錯誤: {e}")
+
+# --- 新增：檢索後處理函數 ---
+def normalize_punctuation(text):
+    """
+    標準化標點符號，將半角標點符號轉換為全角標點符號
+    這可以提高檢索精度，因為文檔中使用的是全角標點符號
+    """
+    # 半角到全角的標點符號映射
+    punctuation_map = {
+        "?": "？",
+        "!": "！",
+        ",": "，",
+        ".": "。",
+        ":": "：",
+        ";": "；",
+        "(": "（",
+        ")": "）",
+        "[": "［",
+        "]": "］",
+        "{": "｛",
+        "}": "｝",
+        '"': '"',
+        "'": "'",
+        "<": "＜",
+        ">": "＞"
+    }
+    
+    for half_width, full_width in punctuation_map.items():
+        text = text.replace(half_width, full_width)
+    
+    return text
 
 # --- 主要執行流程 ---
 if __name__ == "__main__":
@@ -1282,6 +1401,10 @@ if __name__ == "__main__":
             if debug_mode:
                 print("\n=== 調試資訊：檢索結果 ===")
                 
+                # 【修正】在調試模式下也使用標準化後的查詢
+                normalized_question_for_debug = normalize_punctuation(question)
+                print(f"調試查詢 (標準化後): '{normalized_question_for_debug}'")
+
                 if USE_HYBRID_RETRIEVAL:
                     print("混合檢索模式調試：")
                     
@@ -1291,7 +1414,7 @@ if __name__ == "__main__":
                         search_type="similarity_score_threshold",
                         search_kwargs={"k": RETRIEVAL_K, "score_threshold": SIMILARITY_THRESHOLD}
                     )
-                    dense_docs = dense_retriever.get_relevant_documents(question)
+                    dense_docs = dense_retriever.get_relevant_documents(normalized_question_for_debug) # 使用修正後的查詢
                     
                     if dense_docs:
                         print(f"   檢索到 {len(dense_docs)} 個Dense相關文檔")
@@ -1320,10 +1443,8 @@ if __name__ == "__main__":
                     try:
                         bm25_retriever = create_bm25_retriever(texts)
                         if bm25_retriever:
-                            # 對查詢進行分詞
-                            import jieba
-                            processed_query = " ".join(jieba.cut(question))
-                            bm25_docs = bm25_retriever.get_relevant_documents(processed_query)
+                            # 【關鍵修正】不再需要手動分詞，因為分詞功能已內置於檢索器中
+                            bm25_docs = bm25_retriever.get_relevant_documents(normalized_question_for_debug)
                             
                             if bm25_docs:
                                 print(f"   檢索到 {len(bm25_docs)} 個BM25相關文檔")
@@ -1336,6 +1457,8 @@ if __name__ == "__main__":
                                     
                                     if chunk_type == 'qa_separated':
                                         # 分離的問答格式
+                                        # 注意：這裡顯示的page_content是未分詞的原始問題，因為我們只傳遞了分詞函數
+                                        # BM25內部處理分詞，但返回的Document對象保持原樣
                                         doc_question = doc.page_content
                                         answer = doc.metadata.get('answer', '答案未找到')
                                         print(f"      問題: {doc_question[:50]}{'...' if len(doc_question) > 50 else ''}")
@@ -1358,7 +1481,7 @@ if __name__ == "__main__":
                         search_type="similarity_score_threshold",
                         search_kwargs={"k": RETRIEVAL_K, "score_threshold": SIMILARITY_THRESHOLD}
                     )
-                    retrieved_docs = retriever.get_relevant_documents(question)
+                    retrieved_docs = retriever.get_relevant_documents(normalized_question_for_debug) # 使用修正後的查詢
                     
                     if retrieved_docs:
                         print(f"檢索到 {len(retrieved_docs)} 個相關文檔塊：")
@@ -1385,6 +1508,36 @@ if __name__ == "__main__":
                         print("這可能是導致回復'請詢問專家'的原因。")
                 
                 print("=" * 40)
+            
+            # 新增：顯示混合檢索的最終結果（僅在調試模式）
+            if debug_mode:
+                print("\n=== 混合檢索最終結果 ===")
+                if USE_HYBRID_RETRIEVAL:
+                    # 【修正】確保調試也使用標準化查詢
+                    normalized_question_for_debug = normalize_punctuation(question)
+                    # 使用QA鏈的檢索器獲取最終結果
+                    final_retriever = qa_chain.retriever
+                    final_docs = final_retriever.get_relevant_documents(normalized_question_for_debug) # 使用修正後的查詢
+                    
+                    print(f"混合檢索最終排序結果（實際傳給LLM的文檔）：")
+                    for i, doc in enumerate(final_docs):
+                        source = doc.metadata.get('source', '未知來源')
+                        paragraph_index = doc.metadata.get('paragraph_index', -1)
+                        chunk_type = doc.metadata.get('type', 'unknown')
+                        
+                        print(f"  最終-{i+1}: {os.path.basename(source)}, 段落 {paragraph_index}, 類型: {chunk_type}")
+                        
+                        if chunk_type == 'qa_separated':
+                            doc_question = doc.page_content
+                            answer = doc.metadata.get('answer', '答案未找到')
+                            print(f"      問題: {doc_question[:50]}{'...' if len(doc_question) > 50 else ''}")
+                            print(f"      答案: {answer[:50]}{'...' if len(answer) > 50 else ''}")
+                        else:
+                            content_preview = doc.page_content[:100].replace('\n', ' ') + "..."
+                            print(f"      預覽: {content_preview}")
+                else:
+                    print("純Dense檢索模式，最終結果與Dense檢索結果相同")
+                print("=" * 50)
             
             # <-- 直接調用 qa_chain.invoke，傳遞語言參數
             result = qa_chain.invoke({"query": question, "language": tts_language})

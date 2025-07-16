@@ -444,7 +444,7 @@ def create_qa_chain(llm, vectorstore, texts=None):
             retriever = dense_retriever
         
         # 多語言 Prompt 模板 - 支援分離的問答格式
-        template_zh = """你是一個專業的全景抬頭式顯示器(P-HUD)技術專家。請根據以下提供的問答對簡短回答用戶問題。
+        template_zh = """你是一個專業的全景抬頭式顯示器技術專家。請根據以下提供的問答對簡短回答用戶問題。
 
 說明：以下每個項目包含一個相關問題和對應答案。請基於這些資訊回答用戶的問題。
 

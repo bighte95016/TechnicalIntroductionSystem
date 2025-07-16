@@ -1,19 +1,40 @@
-langchain
-langchain-community
-ollama
-pypdf
-chromadb
-sentence-transformers
-langchain-openai
-python-dotenv
-pyaudio
-numpy
-torch
-openai-whisper
-pyttsx3
-SpeechRecognition
-gTTS
-pydub
-simpleaudio
-pypdf2
-PdfReader
+# 核心依賴
+langchain==0.3.26
+langchain-community==0.3.26
+langchain-ollama==0.3.3
+langchain-openai==0.3.11
+chromadb==0.6.3
+ollama==0.5.1
+
+# 文件處理
+PyPDF2==3.0.1
+python-dotenv==1.1.0
+
+# 文本分割和檢索
+jieba==0.42.1
+rank-bm25==0.2.2
+
+# 語音識別 (Whisper)
+openai-whisper==20240930
+numpy==1.26.4
+
+# 音頻處理
+pyaudio==0.2.11
+wave==0.0.2
+
+# TTS (Coqui)
+transformers=4.35.0
+TTS==0.22.0
+pydub==0.25.1
+sounddevice==0.5.1
+
+
+# 基礎依賴
+requests==2.32.3
+urllib3==2.3.0
+certifi==2025.1.31
+charset-normalizer==3.4.1
+idna==3.10
+
+# 打包依賴
+pyinstaller==6.14.1
