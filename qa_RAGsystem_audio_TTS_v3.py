@@ -23,8 +23,6 @@ import torch # PyTorch
 
 # TTS語音合成相關導入
 import pyttsx3  # 用於文字轉語音
-import speech_recognition as sr
-import queue
 
 # --- 在所有 import 之後，第一次訪問環境變數之前調用 load_dotenv --- #
 load_dotenv()

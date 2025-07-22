@@ -34,6 +34,9 @@ sys.path.append(str(pathlib.Path(__file__).parent / "index_tts"))
 from index_tts.indextts.infer import IndexTTS
 import sounddevice as sd
 
+# 新增：pyttsx3語音合成相關導入
+import pyttsx3  # 用於文字轉語音
+
 # --- 在所有 import 之後，第一次訪問環境變數之前調用 load_dotenv --- #
 load_dotenv()
 
@@ -98,6 +101,12 @@ TTS_MODEL_DIR = "./index_tts/checkpoints"  # TTS模型目錄
 TTS_CONFIG_PATH = "./index_tts/checkpoints/config.yaml"  # TTS配置文件路徑
 TTS_VOICE_PATH = "./voice/Senior_Shiu.wav"  # 語音參考文件路徑
 tts_system = None  # 全局變量，用於存儲TTS系統
+
+# --- pyttsx3 TTS設定 ---
+USE_PYTTSX3_FOR_JAPANESE = True  # 是否對日文使用pyttsx3
+TTS_RATE = 130  # pyttsx3語速 (words per minute)
+TTS_VOLUME = 0.8  # pyttsx3音量 (0.0 到 1.0)
+tts_lock = threading.Lock()  # TTS鎖，確保同一時間只有一個TTS引擎運行
 
 # --- 提示音功能設定 ---
 ENABLE_PROMPT_AUDIO = True  # 是否啟用提示音功能（在用戶提問後播放友好提示）
@@ -242,7 +251,8 @@ def speech_to_text():
 def map_whisper_language_to_supported(detected_lang):
     """將 Whisper 檢測的語言代碼映射到我們支持的語言"""
     lang_map = {
-        "zh": "zh", "cn": "zh", "ja": "zh", "ko": "zh",  # 亞洲語言使用中文回答
+        "zh": "zh", "cn": "zh", "ko": "zh",  # 中文和韓文使用中文回答
+        "ja": "ja",  # 日文使用日文回答
         "en": "en", "fr": "en", "de": "en", "es": "en", "my": "en", "ms": "en",  # 西方語言及馬來語使用英文回答
     }
     # 默認使用中文回答
@@ -281,11 +291,23 @@ def load_tts_system():
     
     return True
 
-def text_to_speech(text):
-    """將文本轉換為語音並播放"""
+def text_to_speech(text, language="zh"):
+    """將文本轉換為語音並播放，根據語言選擇TTS引擎"""
     if not ENABLE_TTS_OUTPUT:
         return False
-        
+    
+    # 根據語言和設定選擇TTS引擎
+    if language == "ja" and USE_PYTTSX3_FOR_JAPANESE:
+        # 日文使用pyttsx3
+        print(f"使用pyttsx3播放日文語音")
+        return text_to_speech_pyttsx3(text, language)
+    else:
+        # 中文和英文使用IndexTTS
+        print(f"使用IndexTTS播放 {language} 語音")
+        return text_to_speech_indextts(text)
+
+def text_to_speech_indextts(text):
+    """使用IndexTTS將文本轉換為語音並播放（原有功能）"""
     try:
         # 載入TTS系統
         if not load_tts_system():
@@ -317,7 +339,7 @@ def text_to_speech(text):
         return True
         
     except Exception as e:
-        print(f"TTS語音合成時發生錯誤: {e}")
+        print(f"IndexTTS語音合成時發生錯誤: {e}")
         return False
 
 def clean_text_for_tts(text):
@@ -760,6 +782,8 @@ def create_qa_chain(llm, vectorstore, texts=None):
 
         english_template = """You are a professional robotic bar customer service robot. Please answer user questions based on the provided Q&A pairs below.
 
+LANGUAGE INSTRUCTION: You MUST respond ONLY in English. If the source information is in Chinese, translate it to English before responding.
+
 Instructions: Each item below contains a relevant question and corresponding answer. Please base your response on this information.
 
 Requirements:
@@ -767,15 +791,37 @@ Requirements:
 2. Do not use special symbols like asterisks, dashes, or bullet points.
 3. Answer directly to the point, avoid lengthy explanations.
 4. Prioritize using exactly matching or most relevant Q&A pairs for answers.
-5. If relevant Q&A pairs are found, base your answer on them. Only say "Your question is beyond my scope of knowledge, please consult the counter staff" if no relevant information is found.
-6. You MUST answer in English. Your entire response must be in English ONLY. Do not use any Chinese characters. This is the most important rule.
+5. If relevant Q&A pairs are found, translate the answer to English and base your response on it. Only say "Your question is beyond my scope of knowledge, please consult the counter staff" if no relevant information is found.
+6. CRITICAL: Even if the source Q&A pairs are in Chinese, you MUST translate and respond in English only.
+7. NEVER use Chinese characters in your response. Always translate Chinese content to English.
 
-Relevant Q&A pairs:
+Relevant Q&A pairs (translate Chinese content to English in your response):
 {context}
 
 User question: {question}
 
+TRANSLATION RULE: If any source information is in Chinese, translate it to English first, then provide your answer.
+MANDATORY: Your response must be 100% in English. No Chinese characters allowed.
 Concise answer in English:"""
+
+        japanese_template = """あなたは専門的なロボティックバーのカスタマーサービスロボットです。以下に提供されたQ&Aペアに基づいてユーザーの質問に答えてください。
+
+説明：以下の各項目には、関連する質問と対応する回答が含まれています。この情報に基づいて質問に答えてください。
+
+要件：
+1. 回答は簡潔で明確にし、3文以内にしてください
+2. アスタリスク、ダッシュ、箇条書きなどの特殊記号は使用しないでください
+3. 要点を直接答え、冗長な説明は避けてください
+4. 完全に一致するか最も関連性の高いQ&Aペアを優先的に使用してください
+5. 関連するQ&Aペアが見つかった場合はその答えに基づいて回答し、関連情報がない場合のみ「ご質問は私の対応範囲外です。カウンタースタッフにお尋ねください」と言ってください
+6. 日本語で回答してください
+
+関連Q&Aペア：
+{context}
+
+ユーザーの質問：{question}
+
+簡潔な回答："""
         
         # 自定義文檔格式化函數
         def format_docs(docs):
@@ -804,20 +850,36 @@ Concise answer in English:"""
                     formatted_parts.append(f"Document {i}:\n{doc.page_content}")
             return "\n\n".join(formatted_parts)
         
+        def format_docs_japanese(docs):
+            formatted_parts = []
+            for i, doc in enumerate(docs, 1):
+                # 檢查是否為分離的問答格式
+                if doc.metadata.get('type') == 'qa_separated':
+                    question = doc.page_content
+                    answer = doc.metadata.get('answer', 'Answer not found')
+                    formatted_parts.append(f"Q&A Pair {i}:\nQuestion: {question}\nAnswer: {answer}")
+                else:
+                    # 原始格式
+                    formatted_parts.append(f"Document {i}:\n{doc.page_content}")
+            return "\n\n".join(formatted_parts)
+        
         # 包裝QA鏈以支持多語言
         class MultilingualQAChain:
-            def __init__(self, llm, retriever, chinese_template, english_template, format_func_zh, format_func_en):
+            def __init__(self, llm, retriever, chinese_template, english_template, japanese_template, format_func_zh, format_func_en, format_func_ja):
                 self.llm = llm
                 self.retriever = retriever
                 self.chinese_prompt = PromptTemplate.from_template(chinese_template)
                 self.english_prompt = PromptTemplate.from_template(english_template)
+                self.japanese_prompt = PromptTemplate.from_template(japanese_template)
                 self.format_func_zh = format_func_zh
                 self.format_func_en = format_func_en
+                self.format_func_ja = format_func_ja
             
             def invoke(self, inputs):
                 # 獲取查詢和語言參數
                 query = inputs["query"]
                 language = inputs.get("language", "zh")  # 默認中文
+                print(f"🔍 MultilingualQAChain: 接收到語言參數 = '{language}', 查詢 = '{query[:50]}...'")
                 
                 # 【修正】僅對中文查詢進行標點符號標準化
                 if language == 'zh':
@@ -832,11 +894,18 @@ Concise answer in English:"""
                 if language == "en":
                     formatted_context = self.format_func_en(docs)
                     prompt_text = self.english_prompt.format(context=formatted_context, question=query)
+                    print(f"🔍 MultilingualQAChain: 使用英文模板")
+                elif language == "ja":
+                    formatted_context = self.format_func_ja(docs)
+                    prompt_text = self.japanese_prompt.format(context=formatted_context, question=query)
+                    print(f"🔍 MultilingualQAChain: 使用日文模板")
                 else:
                     formatted_context = self.format_func_zh(docs)
                     prompt_text = self.chinese_prompt.format(context=formatted_context, question=query)
+                    print(f"🔍 MultilingualQAChain: 使用中文模板")
                 
                 # 調用LLM
+                print(f"🔍 MultilingualQAChain: 準備調用LLM，prompt長度 = {len(prompt_text)} 字符")
                 answer = self.llm.invoke(prompt_text)
                 
                 return {
@@ -845,7 +914,7 @@ Concise answer in English:"""
                 }
         
         multilingual_qa_chain = MultilingualQAChain(
-            llm, retriever, chinese_template, english_template, format_docs, format_docs_english
+            llm, retriever, chinese_template, english_template, japanese_template, format_docs, format_docs_english, format_docs_japanese
         )
         
         print("多語言QA鏈建立成功。")
@@ -1081,49 +1150,76 @@ def create_bm25_retriever(texts, cache_dir=BM25_CACHE_DIR):
         return None
 
 def play_prompt_audio(detected_language="zh"):
-    """播放提示音，在用戶提問後、系統開始思考時播放（IndexTTS版本）
+    """播放提示音，在用戶提問後、系統開始思考時播放
     
     Args:
-        detected_language: 檢測到的語言 ('zh' 或 'en')
+        detected_language: 檢測到的語言 ('zh', 'en', 或 'ja')
     """
     if not ENABLE_PROMPT_AUDIO or not ENABLE_TTS_OUTPUT:
-        return
-    
-    # 檢查語音參考文件是否存在
-    if not os.path.exists(TTS_VOICE_PATH):
-        print("⚠️ 語音參考文件不存在，無法播放提示音")
         return
     
     # 創建一個非阻塞的提示音播放函數
     def play_prompt_in_background():
         try:
-            # 載入TTS系統
-            if not load_tts_system():
-                print("⚠️ TTS系統載入失敗，無法播放提示音")
-                return
-            
-            # 根據檢測到的語言選擇提示音文本
-            if detected_language == "en":
-                # 英文提示音
+            # 根據檢測到的語言選擇提示音文本和TTS引擎
+            if detected_language == "ja":
+                # 日文提示音，使用pyttsx3
+                prompt_text = "ご質問ありがとうございます。少しお考えください。"
+                prompt_lang = "日本語"
+                print(f"🎵 播放提示音 ({prompt_lang})...")
+                text_to_speech_pyttsx3(prompt_text, detected_language)
+            elif detected_language == "en":
+                # 英文提示音，使用IndexTTS
                 prompt_text = "Thank you for your question. Let me think about it and get back to you shortly."
                 prompt_lang = "English"
+                print(f"🎵 播放提示音 ({prompt_lang})...")
+                
+                # 檢查語音參考文件是否存在
+                if not os.path.exists(TTS_VOICE_PATH):
+                    print("⚠️ 語音參考文件不存在，無法播放提示音")
+                    return
+                
+                # 載入TTS系統
+                if not load_tts_system():
+                    print("⚠️ TTS系統載入失敗，無法播放提示音")
+                    return
+                
+                # 生成並播放提示音
+                sampling_rate, wav_data = tts_system.infer(
+                    TTS_VOICE_PATH, 
+                    prompt_text, 
+                    output_path=None  # 不保存到文件
+                )
+                
+                # 播放提示音
+                sd.play(wav_data, sampling_rate)
+                sd.wait()  # 等待播放完成
             else:
-                # 中文提示音
+                # 中文提示音，使用IndexTTS
                 prompt_text = "感謝您的提問，我思考一下，請稍後。"
                 prompt_lang = "中文"
-            
-            print(f"🎵 播放提示音 ({prompt_lang})...")
-            
-            # 生成並播放提示音
-            sampling_rate, wav_data = tts_system.infer(
-                TTS_VOICE_PATH, 
-                prompt_text, 
-                output_path=None  # 不保存到文件
-            )
-            
-            # 播放提示音
-            sd.play(wav_data, sampling_rate)
-            sd.wait()  # 等待播放完成
+                print(f"🎵 播放提示音 ({prompt_lang})...")
+                
+                # 檢查語音參考文件是否存在
+                if not os.path.exists(TTS_VOICE_PATH):
+                    print("⚠️ 語音參考文件不存在，無法播放提示音")
+                    return
+                
+                # 載入TTS系統
+                if not load_tts_system():
+                    print("⚠️ TTS系統載入失敗，無法播放提示音")
+                    return
+                
+                # 生成並播放提示音
+                sampling_rate, wav_data = tts_system.infer(
+                    TTS_VOICE_PATH, 
+                    prompt_text, 
+                    output_path=None  # 不保存到文件
+                )
+                
+                # 播放提示音
+                sd.play(wav_data, sampling_rate)
+                sd.wait()  # 等待播放完成
             
             print("✅ 提示音播放完成")
             
@@ -1169,6 +1265,115 @@ def normalize_punctuation(text):
         text = text.replace(half_width, full_width)
     
     return text
+
+# --- 新增：pyttsx3語音合成相關函數 ---
+def initialize_pyttsx3_engine():
+    """檢查pyttsx3 TTS可用性並打印語音信息"""
+    try:
+        print("檢查pyttsx3 TTS可用性...")
+        temp_engine = pyttsx3.init()
+        if temp_engine is None:
+            print("錯誤：無法初始化pyttsx3引擎。")
+            return False
+        
+        temp_engine.setProperty('rate', TTS_RATE)
+        temp_engine.setProperty('volume', TTS_VOLUME)
+        voices = temp_engine.getProperty('voices')
+        print(f"檢測到 {len(voices)} 個pyttsx3語音引擎")
+        
+        # 檢查日文語音可用性
+        japanese_voices = []
+        for i, voice in enumerate(voices):
+            languages = voice.languages if hasattr(voice, 'languages') else ['未知']
+            # 檢查日文語音
+            if any(lang.startswith('ja') for lang in languages):
+                japanese_voices.append(voice)
+            # 檢查名稱中包含日文關鍵詞的語音
+            elif 'japan' in voice.name.lower() or 'japanese' in voice.name.lower():
+                japanese_voices.append(voice)
+        
+        if japanese_voices:
+            print(f"找到 {len(japanese_voices)} 個日文語音引擎")
+            for voice in japanese_voices:
+                print(f"  日文語音: {voice.name}")
+        else:
+            print("⚠️ 未找到專用日文語音，將使用默認語音")
+        
+        print("pyttsx3可用性檢查完成。")
+        return True
+    except Exception as e:
+        print(f"檢查pyttsx3可用性時發生錯誤: {e}")
+        return False
+
+def text_to_speech_pyttsx3(text, language):
+    """使用pyttsx3創建新引擎實例並在鎖保護下播放語音"""
+    if not text or len(text.strip()) == 0:
+        print("警告：嘗試播放空文本")
+        return False
+
+    # 使用鎖確保同一時間只有一個TTS引擎實例在運行
+    print(f"等待pyttsx3鎖以播放 {language} 語音: {text[:30]}...")
+    with tts_lock:
+        print(f"獲取pyttsx3鎖，準備播放 {language} 語音...")
+        engine = None
+        try:
+            print(f"創建新的pyttsx3引擎實例...")
+            engine = pyttsx3.init()
+            if engine is None:
+                print("錯誤：無法初始化新的pyttsx3引擎實例。")
+                return False
+                
+            engine.setProperty('rate', TTS_RATE)
+            engine.setProperty('volume', TTS_VOLUME)
+            print(f"pyttsx3引擎實例創建並配置完成。")
+            
+            # 根據語言選擇合適的語音
+            voices = engine.getProperty('voices')
+            target_voice_id = None
+            
+            if language == "zh":
+                chinese_voices = [v for v in voices if any(lang.startswith('zh') for lang in getattr(v, 'languages', []))]
+                if chinese_voices:
+                    target_voice_id = chinese_voices[0].id
+            elif language == "ja":
+                # 尋找日文語音
+                japanese_voices = [v for v in voices if any(lang.startswith('ja') for lang in getattr(v, 'languages', []))]
+                if japanese_voices:
+                    target_voice_id = japanese_voices[0].id
+                else:
+                    # 如果沒有找到日文語音，嘗試尋找包含"Japanese"或"Japan"的語音
+                    japanese_voices_alt = [v for v in voices if 'japan' in v.name.lower() or 'japanese' in v.name.lower()]
+                    if japanese_voices_alt:
+                        target_voice_id = japanese_voices_alt[0].id
+            else:  # 英文
+                english_voices = [v for v in voices if any(lang.startswith('en') for lang in getattr(v, 'languages', []))]
+                if english_voices:
+                    target_voice_id = english_voices[0].id
+            
+            if target_voice_id:
+                try:
+                    engine.setProperty('voice', target_voice_id)
+                    print(f"已設置 {language} 語音")
+                except Exception as voice_error:
+                    print(f"設置 {language} 語音時出錯: {voice_error}")
+            
+            # 播放語音
+            engine.say(text)
+            print(f"pyttsx3開始播放 {language} 語音...")
+            engine.runAndWait()
+            print(f"pyttsx3語音播放完成。")
+            
+            print(f"釋放pyttsx3鎖...")
+            return True
+            
+        except RuntimeError as e:
+             print(f"pyttsx3語音合成時發生 RuntimeError: {e}")
+             print(f"釋放pyttsx3鎖 (因 RuntimeError)...")
+             return False
+        except Exception as e:
+            print(f"pyttsx3語音合成時發生未預期錯誤: {e}")
+            print(f"釋放pyttsx3鎖 (因 Exception)...")
+            return False
 
 # --- 主要執行流程 ---
 if __name__ == "__main__":
@@ -1256,7 +1461,9 @@ if __name__ == "__main__":
         print("預載入語音識別模型（可能需要一些時間）...")
         load_whisper_model()
         print(f" 語音輸入功能: 已啟用 (Whisper模型: {WHISPER_MODEL_SIZE})")
-        print("    🌐 多語言支持：檢測到英文時將以英文回復，檢測到中文時以中文回復")
+        print("    🌐 多語言支持：檢測到中文時以中文回復，檢測到英文時以英文回復，檢測到日文時以日文回復")
+        print("    🎙️ 日文語音：使用pyttsx3引擎播放")
+        print("    🎵 中英文語音：使用IndexTTS引擎播放")
     else:
         print(" 語音輸入功能: 未啟用")
 
@@ -1266,13 +1473,21 @@ if __name__ == "__main__":
         print("正在初始化TTS語音輸出功能...")
         print("預載入TTS語音合成系統（可能需要一些時間）...")
         if load_tts_system():
-            print(f" TTS語音輸出功能: 已啟用 (語音: {os.path.basename(TTS_VOICE_PATH)})")
+            print(f" IndexTTS語音輸出功能: 已啟用 (語音: {os.path.basename(TTS_VOICE_PATH)})")
             if ENABLE_PROMPT_AUDIO:
                 print("    🎵 提示音功能已啟用（問題處理時播放友好提示）")
             tts_enabled = True
         else:
-            print(" TTS語音輸出功能: 載入失敗，已禁用")
+            print(" IndexTTS語音輸出功能: 載入失敗，已禁用")
             tts_enabled = False
+            
+        # 檢查pyttsx3可用性（用於日文語音）
+        if USE_PYTTSX3_FOR_JAPANESE:
+            print("正在檢查pyttsx3日文語音功能...")
+            if initialize_pyttsx3_engine():
+                print(" pyttsx3日文語音功能: 已啟用")
+            else:
+                print(" pyttsx3日文語音功能: 初始化失敗")
     else:
         print(" TTS語音輸出功能: 未啟用")
 
@@ -1353,7 +1568,8 @@ if __name__ == "__main__":
                     
                     # 將 Whisper 偵測的語言代碼映射到我們支持的語言
                     detected_language = map_whisper_language_to_supported(detected_lang)
-                    print(f"檢測到的語言: {detected_language} ({'中文' if detected_language == 'zh' else '英文'})")
+                    lang_display = {"zh": "中文", "en": "英文", "ja": "日文"}.get(detected_language, detected_language)
+                    print(f"檢測到的語言: {detected_language} ({lang_display})")
             else:
                 # 文字輸入模式
                 print(f"\n{BOLD}=== 文字輸入模式 ==={RESET}")
@@ -1542,9 +1758,11 @@ if __name__ == "__main__":
                 print("=" * 50)
             
             # <-- 直接調用 qa_chain.invoke，傳遞語言參數
+            print(f"🔍 調試信息: 準備調用QA鏈，語言參數 = '{tts_language}'")
             result = qa_chain.invoke({"query": question, "language": tts_language})
             # <-- 從結果中提取 'result'
             answer = result.get('result', '抱歉，無法生成答案。').strip()
+            print(f"🔍 調試信息: QA鏈返回結果長度 = {len(answer)} 字符")
             source_docs = result.get('source_documents', []) # 獲取來源文檔 (可選)
 
             print("\n答案：")
@@ -1555,7 +1773,7 @@ if __name__ == "__main__":
                 last_answer = answer
                 # 自動播放語音，不需要用戶確認
                 print("\n正在播放語音答案...")
-                text_to_speech(answer)
+                text_to_speech(answer, tts_language)
 
             # 可選：顯示來源文件資訊 (保持註解)
             if source_docs and not debug_mode:  # 非調試模式才顯示簡化版本
