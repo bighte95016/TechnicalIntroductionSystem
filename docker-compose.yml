@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # Ollama 服務
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_ORIGINS=*
+    restart: unless-stopped
+    # GPU 支持 (如果可用)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # 如果沒有 GPU，註釋掉上面的 deploy 部分
+
+  # RAG 應用程序
+  rag-app:
+    build: .
+    container_name: rag-app
+    depends_on:
+      - ollama
+    volumes:
+      - ./bar_file:/app/bar_file
+      - ./voice:/app/voice
+      - ./index_tts:/app/index_tts
+      - ./chroma_db:/app/chroma_db
+      - ./bm25_cache:/app/bm25_cache
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - ANONYMIZED_TELEMETRY=False
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    # 音頻設備支持 (Linux)
+    devices:
+      - /dev/snd:/dev/snd
+    # 如果在 Windows 上運行，可能需要註釋掉上面的 devices 部分
+
+volumes:
+  ollama_data: 

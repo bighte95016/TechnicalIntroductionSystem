@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # Ollama 服務
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_HOST=0.0.0.0:11434
+    restart: unless-stopped
+    # Windows 環境下的 GPU 支持（可選）
+    # 如果有 NVIDIA GPU 且已安裝 Docker GPU 支持，取消下面的註釋
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # RAG 應用程序
+  rag-app:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-app
+    depends_on:
+      - ollama
+    volumes:
+      # 使用具名卷而非綁定掛載以提高 Windows 相容性
+      - pdf_data:/app/bar_file
+      - voice_data:/app/voice
+      - tts_data:/app/index_tts
+      - chroma_data:/app/chroma_db
+      - bm25_data:/app/bm25_cache
+      # 環境文件仍使用綁定掛載
+      - ./.env:/app/.env:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - ANONYMIZED_TELEMETRY=False
+      # Windows 環境下建議禁用音頻功能
+      - ENABLE_VOICE_INPUT=False
+      - ENABLE_TTS_OUTPUT=False
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    # Windows 下移除音頻設備映射，避免權限問題
+    # 如果需要音頻功能，請在主機上運行應用程序
+
+  # 數據管理容器（用於複製文件到具名卷）
+  data-manager:
+    image: alpine:latest
+    container_name: data-manager
+    volumes:
+      - pdf_data:/data/pdf
+      - voice_data:/data/voice
+      - tts_data:/data/tts
+      - ./bar_file:/host/bar_file:ro
+      - ./voice:/host/voice:ro
+      - ./index_tts:/host/index_tts:ro
+    command: |
+      sh -c "
+        echo '正在同步數據文件...';
+        cp -r /host/bar_file/* /data/pdf/ 2>/dev/null || echo 'PDF 目錄為空';
+        cp -r /host/voice/* /data/voice/ 2>/dev/null || echo 'Voice 目錄為空';
+        cp -r /host/index_tts/* /data/tts/ 2>/dev/null || echo 'TTS 目錄為空';
+        echo '數據同步完成';
+      "
+    profiles:
+      - tools
+
+volumes:
+  ollama_data:
+    driver: local
+  pdf_data:
+    driver: local
+  voice_data:
+    driver: local
+  tts_data:
+    driver: local
+  chroma_data:
+    driver: local
+  bm25_data:
+    driver: local 
