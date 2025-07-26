@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-真正的RAG聊天機器人 Web UI
-能夠使用完整的RAG系統回答問題，支持語音功能
+RAG聊天機器人 Web UI - 虛擬人物版
+包含完整的虛擬人物動態變化功能
 """
 
 import os
@@ -25,127 +25,152 @@ from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import (
 )
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'real_rag_chatbot_secret_key'
+app.config['SECRET_KEY'] = 'rag_avatar_chatbot_secret_key'
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # 全局變量
 qa_chain = None
 system_ready = False
 initialization_status = "正在初始化..."
-current_recording = None
-recording_lock = threading.Lock()
 
-# 預生成的提示音文件路徑
-PROMPT_AUDIO_FILES = {
-    'zh': None,
-    'en': None,
-    'ja': None
-}
-
-# TTS播放鎖，確保同一時間只有一個語音播放
+# TTS播放鎖
 tts_playback_lock = threading.Lock()
-# 提示音播放鎖，與回答語音分開管理
 prompt_playback_lock = threading.Lock()
 
-# 全局IndexTTS系統實例，避免重複初始化
+# 全局IndexTTS系統實例
 global_tts_system = None
-tts_system_lock = threading.Lock()  # 保護TTS系統初始化的鎖
+tts_system_lock = threading.Lock()
 
-class WebUIManager:
-    """Web UI管理器，處理語音錄音"""
-    
-    def __init__(self):
-        self.is_recording = False
-        self.audio_data = []
-        self.sample_rate = 16000
-        self.temp_audio_file = None
-        
-    def start_recording(self):
-        """開始錄音"""
-        with recording_lock:
-            if self.is_recording:
-                return False
-            
-            self.is_recording = True
-            self.audio_data = []
-            
-            # 創建臨時音頻文件
-            self.temp_audio_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-            self.temp_audio_file.close()
-            
-            return True
-    
-    def add_audio_chunk(self, audio_chunk):
-        """添加音頻數據塊"""
-        if self.is_recording:
-            # 將base64音頻數據轉換為numpy數組
-            audio_array = np.frombuffer(audio_chunk, dtype=np.int16)
-            self.audio_data.extend(audio_array)
-    
-    def stop_recording(self):
-        """停止錄音並保存文件"""
-        with recording_lock:
-            if not self.is_recording:
-                return None
-            
-            self.is_recording = False
-            
-            if self.audio_data and self.temp_audio_file:
-                # 保存音頻文件
-                try:
-                    with wave.open(self.temp_audio_file.name, 'wb') as wf:
-                        wf.setnchannels(1)  # 單聲道
-                        wf.setsampwidth(2)  # 16位
-                        wf.setframerate(self.sample_rate)
-                        wf.writeframes(np.array(self.audio_data, dtype=np.int16).tobytes())
-                    
-                    return self.temp_audio_file.name
-                except Exception as e:
-                    print(f"保存音頻文件時發生錯誤: {e}")
-                    return None
-            
-            return None
-    
-    def cleanup_temp_file(self):
-        """清理臨時文件"""
-        if self.temp_audio_file and os.path.exists(self.temp_audio_file.name):
-            try:
-                os.unlink(self.temp_audio_file.name)
-            except Exception as e:
-                print(f"清理臨時文件時發生錯誤: {e}")
+# 虛擬人物狀態管理
+avatar_state = 'idle'  # idle, thinking, speaking
+avatar_lock = threading.Lock()
 
-# 創建Web UI管理器實例
-web_ui_manager = WebUIManager()
-
-# 增強的HTML模板，包含語音功能
+# HTML模板 - 包含虛擬人物功能
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RAG聊天機器人 - 語音版</title>
+    <title>RAG聊天機器人 - 虛擬人物版</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <style>
         body {
             font-family: 'Microsoft YaHei', Arial, sans-serif;
-            max-width: 900px;
+            max-width: 2000px;
             margin: 0 auto;
             padding: 20px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
         }
-        .container {
+        
+        .main-container {
+            display: flex;
+            gap: 20px;
+            height: calc(100vh - 40px);
+        }
+        
+        .left-panel {
+            flex: 1;
             background: white;
             border-radius: 20px;
             padding: 30px;
             box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow-y: auto;
         }
+        
+        .right-panel {
+            width: 900px;
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .avatar-container {
+            width: 100%;
+            height: 900px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 15px;
+            overflow: hidden;
+            position: relative;
+            margin-bottom: 20px;
+        }
+        
+        .avatar-image {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: 10px;
+            transition: all 0.3s ease;
+        }
+        
+        .avatar-video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            border-radius: 10px;
+        }
+        
+        .avatar-status {
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+            font-weight: bold;
+            background: #e3f2fd;
+            color: #1976d2;
+            border: 2px solid #bbdefb;
+            margin-bottom: 15px;
+            transition: all 0.3s ease;
+        }
+        
+        .avatar-status.thinking {
+            background: #fff3e0;
+            color: #f57c00;
+            border-color: #ffcc02;
+            animation: pulse-orange 1.5s infinite;
+        }
+        
+        .avatar-status.speaking {
+            background: #e8f5e8;
+            color: #2e7d32;
+            border-color: #c8e6c9;
+            animation: pulse-green 1.5s infinite;
+        }
+        
+        @keyframes pulse-orange {
+            0% { box-shadow: 0 0 0 0 rgba(245, 124, 0, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(245, 124, 0, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(245, 124, 0, 0); }
+        }
+        
+        @keyframes pulse-green {
+            0% { box-shadow: 0 0 0 0 rgba(46, 125, 50, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(46, 125, 50, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(46, 125, 50, 0); }
+        }
+        
+        .avatar-info {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            font-size: 14px;
+            color: #6c757d;
+        }
+        
         h1 {
             text-align: center;
             color: #333;
             margin-bottom: 30px;
         }
+        
         .status {
             text-align: center;
             padding: 15px;
@@ -153,16 +178,19 @@ HTML_TEMPLATE = """
             border-radius: 10px;
             font-weight: bold;
         }
+        
         .status.ready {
             background: #d4edda;
             color: #155724;
             border: 1px solid #c3e6cb;
         }
+        
         .status.loading {
             background: #fff3cd;
             color: #856404;
             border: 1px solid #ffeaa7;
         }
+        
         .status.error {
             background: #f8d7da;
             color: #721c24;
@@ -203,6 +231,7 @@ HTML_TEMPLATE = """
             resize: vertical;
             box-sizing: border-box;
         }
+        
         #question:focus {
             outline: none;
             border-color: #667eea;
@@ -222,10 +251,12 @@ HTML_TEMPLATE = """
             width: 100%;
             transition: all 0.3s ease;
         }
+        
         .button:hover:not(:disabled) {
             transform: translateY(-2px);
             box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
         }
+        
         .button:disabled {
             background: #6c757d;
             cursor: not-allowed;
@@ -268,64 +299,116 @@ HTML_TEMPLATE = """
             border-top: 2px solid #e9ecef;
             padding-top: 20px;
         }
+        
         .message {
             margin-bottom: 20px;
             padding: 15px;
             border-radius: 10px;
         }
+        
         .question-msg {
             background: #e3f2fd;
             border-left: 4px solid #2196f3;
         }
+        
         .answer-msg {
             background: #f3e5f5;
             border-left: 4px solid #9c27b0;
             white-space: pre-wrap;
         }
+        
         .timestamp {
             font-size: 12px;
             color: #666;
             margin-top: 5px;
         }
         
-        .audio-player {
-            margin-top: 10px;
-            width: 100%;
+        @media (max-width: 1200px) {
+            .main-container {
+                flex-direction: column;
+                height: auto;
+            }
+            .right-panel {
+                width: 100%;
+            }
         }
         
         @media (max-width: 768px) {
             .input-section {
                 flex-direction: column;
             }
+            .main-container {
+                padding: 10px;
+            }
+            .left-panel, .right-panel {
+                padding: 20px;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🤖 RAG聊天機器人 - 語音版</h1>
-        
-        <div id="status" class="status loading">
-            <span id="statusText">正在初始化系統...</span>
-        </div>
-        
-        <div class="input-section">
-            <div class="text-input-panel">
-                <div class="panel-title">📝 文字輸入</div>
-                <textarea id="question" placeholder="請輸入您的問題..."></textarea>
-                <button class="button" id="textBtn" onclick="askTextQuestion()">提交問題</button>
+    <div class="main-container">
+        <!-- 左側面板 - 聊天界面 -->
+        <div class="left-panel">
+            <h1>🤖 RAG聊天機器人 - 虛擬人物版</h1>
+            
+            <div id="status" class="status loading">
+                <span id="statusText">正在初始化系統...</span>
             </div>
             
-            <div class="voice-input-panel">
-                <div class="panel-title">🎤 語音輸入</div>
-                <button class="button voice-button" id="voiceBtn" onclick="toggleVoiceRecording()">
-                    <span id="voiceIcon">🎤</span>
-                    <span id="voiceText">開始錄音</span>
-                </button>
-                <div class="recording-indicator" id="recordingIndicator"></div>
+            <div class="input-section">
+                <div class="text-input-panel">
+                    <div class="panel-title">📝 文字輸入</div>
+                    <textarea id="question" placeholder="請輸入您的問題..."></textarea>
+                    <button class="button" id="textBtn" onclick="askTextQuestion()">提交問題</button>
+                </div>
+                
+                <div class="voice-input-panel">
+                    <div class="panel-title">🎤 語音輸入</div>
+                    <button class="button voice-button" id="voiceBtn" onclick="toggleVoiceRecording()">
+                        <span id="voiceIcon">🎤</span>
+                        <span id="voiceText">開始錄音</span>
+                    </button>
+                    <div class="recording-indicator" id="recordingIndicator"></div>
+                </div>
             </div>
+            
+            <div id="chatHistory" class="chat-history"></div>
         </div>
         
-        <div id="chatHistory" class="chat-history"></div>
+        <!-- 右側面板 - 虛擬人物 -->
+        <div class="right-panel">
+            <div class="avatar-container" id="avatarContainer">
+                <!-- 靜態圖片 -->
+                <img id="avatarImage" 
+                     src="/static/avatarImage_files/StaticStatus.png" 
+                     alt="AI助手虛擬人物" 
+                     class="avatar-image"
+                     style="display: block;">
+                
+                <!-- 說話視頻 -->
+                <video id="avatarSpeakingVideo" 
+                       class="avatar-video" 
+                       style="display: none;" 
+                       muted
+                       loop
+                       preload="auto"
+                       playsinline>
+                    <source src="/static/avatarImage_files/TalkStatus.mp4" type="video/mp4">
+                    您的瀏覽器不支持視頻播放。
+                </video>
+            </div>
+            
+            <div id="avatarStatus" class="avatar-status">
+                🤖 AI助手待命中
+            </div>
+            
+            <div class="avatar-info">
+                <div>💭 狀態: <span id="avatarCurrentState">待命</span></div>
+                <div>🎵 語音: <span id="avatarVoiceState">靜音</span></div>
+                <div>🧠 思考: <span id="avatarThinkState">空閒</span></div>
+            </div>
+        </div>
     </div>
     
     <script>
@@ -335,9 +418,113 @@ HTML_TEMPLATE = """
         let mediaRecorder = null;
         let audioChunks = [];
         
+        // 虛擬人物狀態管理
+        let avatarState = 'idle'; // idle, thinking, speaking
+        let isAvatarAnimating = false;
+        
+        // 虛擬人物控制函數
+        function setAvatarState(newState, statusText = '', voiceState = '', thinkState = '') {
+            const avatarImage = document.getElementById('avatarImage');
+            const avatarSpeakingVideo = document.getElementById('avatarSpeakingVideo');
+            const avatarStatus = document.getElementById('avatarStatus');
+            const avatarCurrentState = document.getElementById('avatarCurrentState');
+            const avatarVoiceState = document.getElementById('avatarVoiceState');
+            const avatarThinkState = document.getElementById('avatarThinkState');
+            
+            console.log(`🎭 虛擬人物狀態切換: ${avatarState} → ${newState}`);
+            
+            // 停止所有視頻
+            avatarSpeakingVideo.pause();
+            
+            // 隱藏所有元素
+            avatarImage.style.display = 'none';
+            avatarSpeakingVideo.style.display = 'none';
+            
+            // 清除所有狀態類
+            avatarStatus.classList.remove('thinking', 'speaking');
+            
+            avatarState = newState;
+            isAvatarAnimating = true;
+            
+            switch (newState) {
+                case 'idle':
+                    avatarImage.style.display = 'block';
+                    avatarStatus.textContent = statusText || '🤖 AI助手待命中';
+                    avatarCurrentState.textContent = '待命';
+                    avatarVoiceState.textContent = voiceState || '靜音';
+                    avatarThinkState.textContent = thinkState || '空閒';
+                    isAvatarAnimating = false;
+                    console.log('🖼️ 虛擬人物切換到靜態狀態');
+                    break;
+                    
+                case 'thinking': // 有聲思考 (播放提示音)
+                    avatarSpeakingVideo.style.display = 'block';
+                    avatarSpeakingVideo.currentTime = 0;
+                    avatarSpeakingVideo.play().catch(error => {
+                        console.log('❌ 思考時影片播放失敗:', error);
+                        avatarSpeakingVideo.style.display = 'none';
+                        avatarImage.style.display = 'block';
+                    });
+                    
+                    avatarStatus.textContent = statusText || '🤔 AI助手正在思考...';
+                    avatarStatus.classList.add('thinking');
+                    avatarCurrentState.textContent = '思考中';
+                    avatarVoiceState.textContent = voiceState || '提示音播放中';
+                    avatarThinkState.textContent = thinkState || '分析問題';
+                    console.log('🤔 虛擬人物切換到有聲思考狀態 (播放影片)');
+                    break;
+
+                case 'processing': // 無聲思考 (LLM處理)
+                    avatarImage.style.display = 'block';
+                    
+                    avatarStatus.textContent = statusText || '🧠 AI助手處理中...';
+                    avatarStatus.classList.add('thinking'); // 沿用思考的樣式
+                    avatarCurrentState.textContent = '處理中';
+                    avatarVoiceState.textContent = voiceState || '靜音';
+                    avatarThinkState.textContent = thinkState || '生成回答';
+                    console.log('🧠 虛擬人物切換到無聲處理狀態 (靜態圖片)');
+                    break;
+                    
+                case 'speaking':
+                    avatarSpeakingVideo.style.display = 'block';
+                    avatarSpeakingVideo.currentTime = 0;
+                    avatarSpeakingVideo.play().catch(error => {
+                        console.log('❌ 說話動畫播放失敗:', error);
+                        setAvatarState('idle', '🤖 AI助手待命中');
+                    });
+                    
+                    avatarStatus.textContent = statusText || '🗣️ AI助手正在回答';
+                    avatarStatus.classList.add('speaking');
+                    avatarCurrentState.textContent = '說話中';
+                    avatarVoiceState.textContent = voiceState || '播放中';
+                    avatarThinkState.textContent = thinkState || '表達想法';
+                    console.log('🗣️ 虛擬人物切換到說話狀態');
+                    break;
+                    
+                default:
+                    console.log('⚠️ 未知的虛擬人物狀態:', newState);
+                    setAvatarState('idle');
+                    break;
+            }
+        }
+        
+        // 移除輔助函數 setAvatarThinking, setAvatarSpeaking, setAvatarIdle
+        
         // WebSocket事件處理
         socket.on('system_status', function(data) {
             updateSystemStatus(data.status, data.message);
+        });
+        
+        // 虛擬人物狀態變化事件處理
+        socket.on('avatar_state_change', function(data) {
+            console.log('🎭 收到虛擬人物狀態變化:', data);
+            // 直接使用後端傳來的狀態進行設置
+            setAvatarState(
+                data.state,
+                data.message,      // statusText
+                data.voice_state,  // voiceState
+                data.think_state   // thinkState
+            );
         });
         
         function updateSystemStatus(status, message) {
@@ -370,7 +557,6 @@ HTML_TEMPLATE = """
             const chatHistory = document.getElementById('chatHistory');
             const timestamp = new Date().toLocaleTimeString();
             
-            // 所有語音都在服務器端播放，前端不需要顯示語音狀態
             console.log(`💬 添加新消息 (語言: ${language})`);
             
             const messageHTML = `
@@ -408,12 +594,10 @@ HTML_TEMPLATE = """
             textBtn.disabled = true;
             textBtn.textContent = '處理中...';
             
-            // 直接處理問題，提示音在服務器端播放
-            console.log('💬 開始處理文字問題，提示音將在服務器端播放');
+            console.log('💬 開始處理文字問題');
             await processTextQuestion(question);
         }
         
-        // 處理文字問題的實際邏輯
         async function processTextQuestion(question) {
             const textBtn = document.getElementById('textBtn');
             
@@ -426,7 +610,6 @@ HTML_TEMPLATE = """
                 
                 const data = await response.json();
                 if (data.success) {
-                    // 確保audio_url有效才傳遞，否則傳遞null
                     const validAudioUrl = (data.audio_url && data.audio_url !== 'null') ? data.audio_url : null;
                     const language = data.language || 'zh';
                     addMessage(data.question, data.answer, validAudioUrl, language);
@@ -512,9 +695,7 @@ HTML_TEMPLATE = """
         
         function processAudioBlob(audioBlob) {
             console.log('🎤 語音錄製完成，準備處理...');
-            
-            // 直接處理語音請求，提示音在服務器端播放
-            console.log('💬 開始處理語音問題，提示音將在服務器端播放');
+            console.log('💬 開始處理語音問題');
             processVoiceRequest(audioBlob);
         }
         
@@ -530,7 +711,6 @@ HTML_TEMPLATE = """
                 
                 const data = await response.json();
                 if (data.success) {
-                    // 確保audio_url有效才傳遞，否則傳遞null
                     const validAudioUrl = (data.audio_url && data.audio_url !== 'null') ? data.audio_url : null;
                     const language = data.language || 'zh';
                     addMessage(data.question, data.answer, validAudioUrl, language);
@@ -563,111 +743,60 @@ HTML_TEMPLATE = """
 
         // 頁面載入完成後的初始化
         document.addEventListener('DOMContentLoaded', function() {
-            console.log('RAG聊天機器人 Web UI 已載入');
+            console.log('RAG聊天機器人 Web UI 已載入（虛擬人物版）');
             
-            // 添加用戶交互來啟用自動播放
-            document.body.addEventListener('click', function enableAutoplay() {
-                console.log('用戶已交互，音頻自動播放已啟用');
-                // 移除監聽器，只需要一次交互
-                document.body.removeEventListener('click', enableAutoplay);
-            }, { once: true });
-        });
-        
-        // 添加音頻播放狀態管理
-        let isAudioPlaying = false;
-        let currentAudio = null;  // 追蹤當前播放的音頻元素
-        
-        function playAudioSafely(audioElement) {
-            console.log('🎵 playAudioSafely: 準備播放新音頻');
+            // 預載入視頻以減少切換延遲
+            const avatarSpeakingVideo = document.getElementById('avatarSpeakingVideo');
             
-            // 強制停止當前播放的音頻
-            if (currentAudio && !currentAudio.paused) {
-                console.log('⏸️ playAudioSafely: 強制停止當前播放的音頻');
-                currentAudio.pause();
-                currentAudio.currentTime = 0;
-                currentAudio = null;
-            }
+            avatarSpeakingVideo.load();
             
-            // 停止所有其他可能正在播放的音頻（更徹底的清理）
-            const allAudios = document.querySelectorAll('audio');
-            console.log(`🔍 playAudioSafely: 找到 ${allAudios.length} 個音頻元素`);
-            allAudios.forEach((audio, index) => {
-                if (!audio.paused) {
-                    console.log(`⏸️ playAudioSafely: 停止音頻元素 ${index}`);
-                    audio.pause();
-                    audio.currentTime = 0;
-                }
+            avatarSpeakingVideo.addEventListener('loadeddata', function() {
+                console.log('✅ 說話視頻預載入完成');
             });
             
-            // 重置全局狀態
-            isAudioPlaying = false;
-            currentAudio = null;
-            
-            // 等待一小段時間確保所有音頻都已停止
-            setTimeout(() => {
-                // 設置新的當前音頻
-                currentAudio = audioElement;
-                isAudioPlaying = true;
+            // 用戶交互啟用自動播放
+            document.body.addEventListener('click', function enableAutoplay() {
+                console.log('用戶已交互，音頻和視頻自動播放已啟用');
                 
-                // 設置音頻結束事件
-                audioElement.onended = function() {
-                    isAudioPlaying = false;
-                    currentAudio = null;
-                    console.log('🔊 playAudioSafely: 音頻播放完成');
-                };
-                
-                // 設置音頻暫停事件
-                audioElement.onpause = function() {
-                    if (currentAudio === audioElement) {
-                        isAudioPlaying = false;
-                        currentAudio = null;
-                        console.log('⏸️ playAudioSafely: 音頻被暫停');
-                    }
-                };
-                
-                // 開始播放
-                const playPromise = audioElement.play();
-                if (playPromise !== undefined) {
-                    playPromise.then(() => {
-                        console.log('🔊 playAudioSafely: 音頻開始播放');
+                // 預熱視頻播放
+                [avatarSpeakingVideo].forEach((video, index) => {
+                    video.currentTime = 0;
+                    video.play().then(() => {
+                        video.pause();
+                        console.log(`✅ 視頻${index + 1}預熱完成`);
                     }).catch(error => {
-                        isAudioPlaying = false;
-                        currentAudio = null;
-                        console.log('⚠️ playAudioSafely: 音頻播放失敗:', error);
-                        // 顯示控制器讓用戶手動播放
-                        audioElement.controls = true;
-                        audioElement.style.display = 'block';
+                        console.log(`⚠️ 視頻${index + 1}預熱失敗:`, error);
                     });
-                }
-            }, 100);  // 100ms延遲確保清理完成
-        }
+                });
+                
+                document.body.removeEventListener('click', enableAutoplay);
+            }, { once: true });
+            
+            // 確保虛擬人物初始狀態正確
+            setAvatarState('idle', '🤖 AI助手待命中', '靜音', '空閒');
+        });
     </script>
 </body>
 </html>
 """
 
+# 這裡需要包含所有的後端函數，包括修改過的generate_tts_audio等
+# 為了簡潔，我將只展示關鍵的修改部分
+
 def get_global_tts_system():
-    """獲取全局IndexTTS系統實例，如果未初始化則進行初始化（單例模式）"""
+    """獲取全局IndexTTS系統實例"""
     global global_tts_system, tts_system_lock
     
-    # 如果已經初始化，直接返回
     if global_tts_system is not None:
         return global_tts_system
     
-    # 使用鎖確保只有一個線程進行初始化
     with tts_system_lock:
-        # 雙重檢查，防止在等待鎖的過程中其他線程已經初始化了
         if global_tts_system is not None:
             return global_tts_system
         
         try:
-            # 導入所需模組
-            from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import (
-                TTS_MODEL_DIR, TTS_CONFIG_PATH, TTS_VOICE_PATH
-            )
             from index_tts.indextts.infer import IndexTTS
             
-            # 檢查必要文件
             if not os.path.exists(TTS_MODEL_DIR):
                 print(f"❌ TTS模型目錄不存在: {TTS_MODEL_DIR}")
                 return None
@@ -678,461 +807,280 @@ def get_global_tts_system():
                 print(f"❌ 語音參考文件不存在: {TTS_VOICE_PATH}")
                 return None
             
-            # 初始化IndexTTS系統（只初始化一次）
             print("🔧 正在初始化全局IndexTTS系統...")
             global_tts_system = IndexTTS(model_dir=TTS_MODEL_DIR, cfg_path=TTS_CONFIG_PATH)
-            print(f"✅ 全局IndexTTS系統初始化成功，可重複使用")
+            print(f"✅ 全局IndexTTS系統初始化成功")
             return global_tts_system
             
         except Exception as e:
             print(f"❌ 全局IndexTTS系統初始化失敗: {e}")
-            import traceback
-            print(f"詳細錯誤: {traceback.format_exc()}")
             global_tts_system = None
             return None
 
-def cleanup_global_tts_system():
-    """清理全局IndexTTS系統（在程序退出時調用）"""
-    global global_tts_system
-    if global_tts_system is not None:
-        try:
-            # 如果IndexTTS有清理方法，在這裡調用
-            print("🔧 清理全局IndexTTS系統...")
-            global_tts_system = None
-            print("✅ 全局IndexTTS系統已清理")
-        except Exception as e:
-            print(f"⚠️ 清理IndexTTS系統時發生錯誤: {e}")
-
-def play_japanese_tts_system(text):
-    """使用pyttsx3直接透過系統播放日文語音"""
+def play_chinese_english_tts_system(text, language, set_idle_on_finish=True, is_prompt=False):
+    """使用IndexTTS直接透過系統播放中文或英文語音，並可選擇在播放完成後切換虛擬人物狀態"""
     global tts_playback_lock
     
-    # 檢查是否已有語音在播放
     if not tts_playback_lock.acquire(blocking=False):
-        print("⚠️ 另一個語音正在播放中，跳過此次播放")
+        print("⚠️ IndexTTS或日文TTS正在播放中，跳過此次播放")
+        return False
+    
+    try:
+        def play_speech_thread():
+            try:
+                tts_system = get_global_tts_system()
+                if tts_system is None:
+                    raise Exception("無法獲取IndexTTS系統")
+
+                cleaned_text = clean_text_for_tts(text)
+                if not cleaned_text:
+                    raise Exception("文本清理後為空")
+
+                print(f"🔊 正在生成 {language} 語音...")
+                sampling_rate, wav_data = tts_system.infer(TTS_VOICE_PATH, cleaned_text, output_path=None)
+                
+                if wav_data is None or len(wav_data) == 0:
+                    raise Exception("IndexTTS返回空音頻數據")
+
+                print(f"✅ 音頻生成成功，準備播放...")
+                
+                # 在播放前一刻才發送狀態
+                state_to_emit = 'thinking' if is_prompt else 'speaking'
+                state_message = f'正在播放提示音 ({language})' if is_prompt else f'正在回答您的問題 ({language})'
+                voice_state_message = '提示音播放中' if is_prompt else '回答播放中'
+                think_state_message = '初步分析' if is_prompt else '表達答案'
+
+                print(f"🎬 通知前端切換 '{state_to_emit}' 狀態")
+                socketio.emit('avatar_state_change', {
+                    'state': state_to_emit, 
+                    'language': language,
+                    'message': state_message,
+                    'voice_state': voice_state_message,
+                    'think_state': think_state_message
+                })
+
+                import sounddevice as sd
+                sd.play(wav_data, sampling_rate)
+                sd.wait()
+                print(f"✅ {language} 語音播放完成")
+                
+                if set_idle_on_finish:
+                    socketio.emit('avatar_state_change', {
+                        'state': 'idle', 
+                        'language': language, 
+                        'message': '🤖 AI助手待命中',
+                        'voice_state': '靜音',
+                        'think_state': '空閒'
+                    })
+                
+            except Exception as play_error:
+                print(f"❌ IndexTTS播放過程中發生錯誤: {play_error}")
+                if set_idle_on_finish:
+                    socketio.emit('avatar_state_change', {'state': 'idle', 'language': language, 'message': 'TTS播放發生錯誤'})
+            finally:
+                tts_playback_lock.release()
+                print("🔓 IndexTTS語音鎖已釋放")
+        
+        play_thread = threading.Thread(target=play_speech_thread, daemon=True)
+        play_thread.start()
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ IndexTTS語音播放時發生錯誤: {e}")
+        tts_playback_lock.release()
+        if set_idle_on_finish:
+            socketio.emit('avatar_state_change', {'state': 'idle', 'language': language, 'message': 'TTS啟動錯誤'})
+        return False
+
+def play_japanese_tts_system(text, set_idle_on_finish=True, is_prompt=False):
+    """使用pyttsx3直接透過系統播放日文語音，並可選擇在播放完成後切換虛擬人物狀態"""
+    global tts_playback_lock
+    
+    if not tts_playback_lock.acquire(blocking=False):
+        print("⚠️ IndexTTS或日文TTS正在播放中，跳過此次播放")
         return False
     
     try:
         import pyttsx3
         import threading
-        import time
         
-        print(f"🎌 準備播放日文語音: {text[:30]}...")
-        
-        # 使用線程安全的方式播放語音
         def play_speech_thread():
             engine = None
             try:
-                # 每次都創建新的引擎實例，避免run loop衝突
                 engine = pyttsx3.init()
                 if engine is None:
-                    print("❌ 無法初始化pyttsx3引擎")
-                    return False
+                    raise Exception("無法初始化pyttsx3引擎")
+
+                engine.setProperty('rate', 150)
+                engine.setProperty('volume', 0.9)
                 
-                # 設置語音屬性
-                try:
-                    # 設置語速
-                    engine.setProperty('rate', 150)  # 稍慢一點的語速
-                    engine.setProperty('volume', 0.9)  # 音量
-                    
-                    # 嘗試設置日文語音
-                    voices = engine.getProperty('voices')
-                    japanese_voice_found = False
-                    
-                    if voices:
-                        for voice in voices:
-                            # 檢查語音名稱中是否包含日文相關關鍵詞
-                            voice_name = voice.name.lower()
-                            if any(keyword in voice_name for keyword in ['japan', 'japanese', 'ja-jp', 'haruka', 'ayumi']):
-                                try:
-                                    engine.setProperty('voice', voice.id)
-                                    japanese_voice_found = True
-                                    print(f"✅ 找到並設置日文語音: {voice.name}")
-                                    break
-                                except Exception as voice_error:
-                                    print(f"⚠️ 設置語音失敗: {voice_error}")
-                                    continue
-                    
-                    if not japanese_voice_found:
-                        print("⚠️ 未找到專用日文語音，使用默認語音")
-                    
-                except Exception as setup_error:
-                    print(f"⚠️ 語音設置過程中發生錯誤: {setup_error}")
+                voices = engine.getProperty('voices')
+                japanese_voice_found = False
                 
-                # 清理文本
-                from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import clean_text_for_tts
+                if voices:
+                    for voice in voices:
+                        voice_name = voice.name.lower()
+                        if any(keyword in voice_name for keyword in ['japan', 'japanese', 'ja-jp', 'haruka', 'ayumi']):
+                            try:
+                                engine.setProperty('voice', voice.id)
+                                japanese_voice_found = True
+                                print(f"✅ 找到並設置日文語音: {voice.name}")
+                                break
+                            except Exception as voice_error:
+                                print(f"⚠️ 設置語音失敗: {voice_error}")
+                                continue
+                
+                if not japanese_voice_found:
+                    print("⚠️ 未找到專用日文語音，使用默認語音")
+                
                 cleaned_text = clean_text_for_tts(text)
                 if not cleaned_text:
-                    print("❌ 日文文本清理後為空")
-                    return False
+                    raise Exception("日文文本清理後為空")
                 
-                # 播放語音
+                # 在播放前一刻才發送狀態
+                state_to_emit = 'thinking' if is_prompt else 'speaking'
+                state_message = '正在播放提示音 (ja)' if is_prompt else '正在回答您的問題 (ja)'
+                voice_state_message = '提示音播放中' if is_prompt else '回答播放中'
+                think_state_message = '初步分析' if is_prompt else '表達答案'
+
+                print(f"🎬 通知前端切換 '{state_to_emit}' 狀態")
+                socketio.emit('avatar_state_change', {
+                    'state': state_to_emit, 
+                    'language': 'ja',
+                    'message': state_message,
+                    'voice_state': voice_state_message,
+                    'think_state': think_state_message
+                })
+
                 print(f"🔊 開始播放日文語音...")
                 engine.say(cleaned_text)
                 engine.runAndWait()
                 print(f"✅ 日文語音播放完成")
-                return True
+
+                if set_idle_on_finish:
+                    socketio.emit('avatar_state_change', {
+                        'state': 'idle', 
+                        'language': 'ja', 
+                        'message': '🤖 AI助手待命中',
+                        'voice_state': '靜音',
+                        'think_state': '空閒'
+                    })
                 
             except Exception as play_error:
                 print(f"❌ 播放過程中發生錯誤: {play_error}")
-                return False
+                if set_idle_on_finish:
+                    socketio.emit('avatar_state_change', {'state': 'idle', 'language': 'ja', 'message': 'TTS播放發生错误'})
             finally:
-                # 確保引擎資源被正確清理
                 if engine is not None:
                     try:
-                        # 停止引擎
                         engine.stop()
-                        print("🔧 pyttsx3引擎已停止")
-                    except Exception as stop_error:
-                        print(f"⚠️ 停止引擎時發生錯誤: {stop_error}")
-                    
-                    try:
-                        # 刪除引擎實例
                         del engine
-                        print("🔧 pyttsx3引擎實例已清理")
-                    except Exception as del_error:
-                        print(f"⚠️ 清理引擎實例時發生錯誤: {del_error}")
-                
-                # 釋放鎖
+                    except:
+                        pass
                 tts_playback_lock.release()
                 print("🔓 日文TTS鎖已釋放")
         
-        # 在新線程中播放，避免阻塞主線程
         play_thread = threading.Thread(target=play_speech_thread, daemon=True)
         play_thread.start()
-        
-        # 等待一小段時間確保播放開始
-        time.sleep(0.5)
         
         return True
         
     except ImportError:
         print("❌ pyttsx3未安裝，無法播放日文語音")
         tts_playback_lock.release()
+        if set_idle_on_finish:
+            socketio.emit('avatar_state_change', {'state': 'idle', 'language': 'ja'})
         return False
     except Exception as e:
         print(f"❌ 日文語音播放時發生錯誤: {e}")
-        import traceback
-        print(f"詳細錯誤: {traceback.format_exc()}")
         tts_playback_lock.release()
+        if set_idle_on_finish:
+            socketio.emit('avatar_state_change', {'state': 'idle', 'language': 'ja', 'message': 'TTS啟動錯誤'})
         return False
 
-def play_chinese_english_tts_system(text, language):
-    """使用IndexTTS直接透過系統播放中文或英文語音"""
-    global tts_playback_lock # 使用同一個鎖來管理所有TTS播放
-    
-    # 檢查是否已有語音在播放
-    if not tts_playback_lock.acquire(blocking=False):
-        print("⚠️ 另一個語音正在播放中，跳過此次播放")
-        return False
-    
-    try:
-        import threading
-        import time
-        
-        print(f"🔊 準備使用IndexTTS播放 {language} 語音: {text[:30]}...")
-        
-        # 使用線程安全的方式播放語音
-        def play_speech_thread():
-            try:
-                # 獲取全局IndexTTS系統（只初始化一次）
-                tts_system = get_global_tts_system()
-                if tts_system is None:
-                    print("❌ 無法獲取IndexTTS系統")
-                    return False
-                
-                # 導入所需模組
-                from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import (
-                    clean_text_for_tts, TTS_VOICE_PATH
-                )
-                import sounddevice as sd
-                
-                # 清理文本
-                cleaned_text = clean_text_for_tts(text)
-                if not cleaned_text:
-                    print("❌ 文本清理後為空")
-                    return False
-                
-                print(f"🔊 正在生成 {language} 語音...")
-                
-                # 使用全局IndexTTS系統生成音頻數據
-                sampling_rate, wav_data = tts_system.infer(
-                    TTS_VOICE_PATH, 
-                    cleaned_text, 
-                    output_path=None  # 不保存到文件，直接返回音頻數據
-                )
-                
-                if wav_data is None or len(wav_data) == 0:
-                    print("❌ IndexTTS返回空音頻數據")
-                    return False
-                
-                print(f"✅ 音頻生成成功: sampling_rate={sampling_rate}, data_length={len(wav_data)}")
-                
-                # 播放音頻
-                print(f"🔊 開始播放 {language} 語音...")
-                sd.play(wav_data, sampling_rate)
-                sd.wait()  # 等待播放完成
-                print(f"✅ {language} 語音播放完成")
-                return True
-                
-            except Exception as play_error:
-                print(f"❌ IndexTTS播放過程中發生錯誤: {play_error}")
-                import traceback
-                print(f"詳細錯誤: {traceback.format_exc()}")
-                return False
-            finally:
-                # 釋放鎖
-                tts_playback_lock.release()
-                print("🔓 IndexTTS語音鎖已釋放")
-        
-        # 在新線程中播放，避免阻塞主線程
-        play_thread = threading.Thread(target=play_speech_thread, daemon=True)
-        play_thread.start()
-        
-        # 等待一小段時間確保播放開始
-        time.sleep(0.5)
-        
-        return True
-        
-    except ImportError as import_error:
-        print(f"❌ IndexTTS相關模組導入失敗: {import_error}")
-        tts_playback_lock.release()
-        return False
-    except Exception as e:
-        print(f"❌ IndexTTS語音播放時發生錯誤: {e}")
-        import traceback
-        print(f"詳細錯誤: {traceback.format_exc()}")
-        tts_playback_lock.release()
-        return False
-
-def generate_tts_audio(text, language):
-    """生成TTS音頻並直接透過系統播放，返回成功/失敗狀態"""
+def generate_tts_audio_with_avatar(text, language):
+    """
+    生成TTS音頻並直接透過系統播放。
+    虛擬人物的狀態變化（speaking, idle）將在播放函數內部處理，以確保同步。
+    """
     if not ENABLE_TTS_OUTPUT:
         print("⚠️ TTS功能已禁用")
         return False
     
     try:
-        # 所有語言都直接透過系統播放，不生成音檔
+        # 根據語言選擇TTS系統，播放函數將負責處理 avatar 狀態
         if language == "ja" and USE_PYTTSX3_FOR_JAPANESE:
-            # 日文使用pyttsx3
-            print("日文將使用pyttsx3直接透過系統播放語音")
-            success = play_japanese_tts_system(text)
-            if success:
-                print("✅ 日文語音播放成功")
-                return True
-            else:
-                print("❌ 日文語音播放失敗")
-                return False
+            success = play_japanese_tts_system(text, set_idle_on_finish=True, is_prompt=False)
         else:
-            # 中文和英文使用IndexTTS系統播放
-            print(f"正在使用IndexTTS直接播放 {language} 語音")
-            success = play_chinese_english_tts_system(text, language)
-            if success:
-                print(f"✅ {language} 語音播放成功")
-                return True
-            else:
-                print(f"❌ {language} 語音播放失敗")
-                return False
+            success = play_chinese_english_tts_system(text, language, set_idle_on_finish=True, is_prompt=False)
+        
+        return success
             
     except Exception as e:
         print(f"❌ 生成TTS音頻時發生未預期錯誤: {e}")
-        import traceback
-        print(f"TTS錯誤詳情: {traceback.format_exc()}")
+        # 確保在啟動失敗時也能切換回idle
+        socketio.emit('avatar_state_change', {
+            'state': 'idle',
+            'language': language,
+            'message': 'TTS啟動時發生錯誤'
+        })
         return False
 
-def pregenerate_prompt_audio():
-    """所有語音都改為系統播放，不需要預生成提示音文件"""
-    global PROMPT_AUDIO_FILES
-    
-    if not ENABLE_PROMPT_AUDIO or not ENABLE_TTS_OUTPUT:
-        print("提示音功能已禁用，跳過預生成")
-        return
-    
-    print("🎵 所有語音已改為系統直接播放，不需要預生成提示音文件")
-    
-    # 清空提示音文件字典，因為不再需要
-    PROMPT_AUDIO_FILES = {
-        'zh': None,
-        'en': None,
-        'ja': None
-    }
-    
-    print("✅ 提示音系統已配置為直接播放模式")
-
-def generate_prompt_audio_async(language="zh"):
-    """異步播放提示音，不阻塞主線程"""
+def generate_prompt_audio_with_avatar_async(language="zh"):
+    """異步播放提示音並控制虛擬人物思考狀態"""
     if not ENABLE_PROMPT_AUDIO or not ENABLE_TTS_OUTPUT:
         return None
     
     def play_prompt_in_background():
-        """在後台線程播放提示音"""
-        try:
-            print(f"🎵 準備播放 {language} 提示音（後台播放）...")
-            
-            # 提示音文本
-            prompt_texts = {
-                'zh': "感謝您的提問，我思考一下，請稍後。",
-                'en': "Thank you for your question. Let me think about it and get back to you shortly.",
-                'ja': "ご質問ありがとうございます。少しお考えください。"
-            }
-            
-            prompt_text = prompt_texts.get(language, prompt_texts['zh'])
-            
-            # 根據語言選擇播放方式
-            if language == "ja" and USE_PYTTSX3_FOR_JAPANESE:
-                # 日文使用pyttsx3 - 同步播放
-                play_japanese_prompt_sync(prompt_text)
-            else:
-                # 中文和英文使用IndexTTS - 同步播放
-                play_indexTTS_prompt_sync(prompt_text, language)
-            
-            print(f"✅ {language} 提示音播放完成（後台）")
-            
-        except Exception as e:
-            print(f"❌ 後台播放 {language} 提示音時發生錯誤: {e}")
+        # 使用專用的提示音鎖
+        with prompt_playback_lock:
+            try:
+                print(f"🎵 準備播放 {language} 提示音（後台播放）...")
+                
+                prompt_texts = {
+                    'zh': "感謝您的提問，我思考一下，請稍後。",
+                    'en': "Thank you for your question. Let me think about it and get back to you shortly.",
+                    'ja': "ご質問ありがとうございます。少しお考えください。"
+                }
+                
+                prompt_text = prompt_texts.get(language, prompt_texts['zh'])
+                
+                # 使用TTS播放函數，讓它發送 thinking 狀態，且在結束時不切換回idle
+                if language == "ja" and USE_PYTTSX3_FOR_JAPANESE:
+                    play_japanese_tts_system(prompt_text, set_idle_on_finish=False, is_prompt=True)
+                else:
+                    play_chinese_english_tts_system(prompt_text, language, set_idle_on_finish=False, is_prompt=True)
+                
+                # 等待鎖被釋放，表示播放完成
+                tts_playback_lock.acquire()
+                tts_playback_lock.release()
+                
+                print(f"✅ {language} 提示音播放完成，進入靜默思考階段...")
+                # 提示音結束後，切換到無聲的處理狀態
+                socketio.emit('avatar_state_change', {
+                    'state': 'processing',
+                    'language': language,
+                    'message': '正在深入思考您的問題...',
+                    'voice_state': '靜音',
+                    'think_state': '生成回答'
+                })
+                
+            except Exception as e:
+                print(f"❌ 後台播放 {language} 提示音時發生錯誤: {e}")
+                socketio.emit('avatar_state_change', {
+                    'state': 'idle',
+                    'language': language,
+                    'message': '提示音播放發生錯誤',
+                    'voice_state': '靜音',
+                    'think_state': '錯誤'
+                })
     
-    # 在後台線程中播放提示音，不阻塞主線程
     import threading
     prompt_thread = threading.Thread(target=play_prompt_in_background, daemon=True)
     prompt_thread.start()
     
-    return prompt_thread  # 返回線程對象，以便需要時可以等待
-
-def generate_prompt_audio(language="zh"):
-    """直接透過系統播放提示音，並等待播放完成（保留同步版本以備需要）"""
-    global prompt_playback_lock
-    
-    if not ENABLE_PROMPT_AUDIO or not ENABLE_TTS_OUTPUT:
-        return None
-    
-    # 使用提示音專用鎖
-    with prompt_playback_lock:
-        try:
-            print(f"🎵 準備播放 {language} 提示音...")
-            
-            # 提示音文本
-            prompt_texts = {
-                'zh': "感謝您的提問，我思考一下，請稍後。",
-                'en': "Thank you for your question. Let me think about it and get back to you shortly.",
-                'ja': "ご質問ありがとうございます。少しお考えください。"
-            }
-            
-            prompt_text = prompt_texts.get(language, prompt_texts['zh'])
-            
-            # 根據語言選擇播放方式
-            if language == "ja" and USE_PYTTSX3_FOR_JAPANESE:
-                # 日文使用pyttsx3 - 同步播放
-                play_japanese_prompt_sync(prompt_text)
-            else:
-                # 中文和英文使用IndexTTS - 同步播放
-                play_indexTTS_prompt_sync(prompt_text, language)
-            
-            print(f"✅ {language} 提示音播放完成")
-            return None  # 不返回音頻URL，因為是系統播放
-            
-        except Exception as e:
-            print(f"❌ 播放 {language} 提示音時發生錯誤: {e}")
-            import traceback
-            print(f"詳細錯誤: {traceback.format_exc()}")
-            return None
-
-def play_japanese_prompt_sync(text):
-    """同步播放日文提示音"""
-    try:
-        import pyttsx3
-        
-        engine = pyttsx3.init()
-        if engine is None:
-            print("❌ 無法初始化pyttsx3引擎")
-            return False
-        
-        try:
-            # 設置語音屬性
-            engine.setProperty('rate', 150)
-            engine.setProperty('volume', 0.9)
-            
-            # 嘗試設置日文語音
-            voices = engine.getProperty('voices')
-            for voice in voices:
-                voice_name = voice.name.lower()
-                if any(keyword in voice_name for keyword in ['japan', 'japanese', 'ja-jp', 'haruka', 'ayumi']):
-                    try:
-                        engine.setProperty('voice', voice.id)
-                        print(f"✅ 設置日文提示音語音: {voice.name}")
-                        break
-                    except:
-                        continue
-            
-            # 清理文本
-            from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import clean_text_for_tts
-            cleaned_text = clean_text_for_tts(text)
-            if not cleaned_text:
-                return False
-            
-            # 同步播放
-            print(f"🔊 播放日文提示音...")
-            engine.say(cleaned_text)
-            engine.runAndWait()
-            print(f"✅ 日文提示音播放完成")
-            return True
-            
-        finally:
-            try:
-                engine.stop()
-                del engine
-            except:
-                pass
-                
-    except Exception as e:
-        print(f"❌ 日文提示音播放錯誤: {e}")
-        return False
-
-def play_indexTTS_prompt_sync(text, language):
-    """同步播放IndexTTS提示音"""
-    try:
-        # 獲取全局IndexTTS系統（只初始化一次）
-        tts_system = get_global_tts_system()
-        if tts_system is None:
-            print("❌ 無法獲取IndexTTS系統")
-            return False
-        
-        # 導入所需模組
-        from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import (
-            clean_text_for_tts, TTS_VOICE_PATH
-        )
-        import sounddevice as sd
-        
-        # 清理文本
-        cleaned_text = clean_text_for_tts(text)
-        if not cleaned_text:
-            return False
-        
-        print(f"🔊 正在生成 {language} 提示音...")
-        
-        # 使用全局IndexTTS系統生成音頻數據
-        sampling_rate, wav_data = tts_system.infer(
-            TTS_VOICE_PATH, 
-            cleaned_text, 
-            output_path=None
-        )
-        
-        if wav_data is None or len(wav_data) == 0:
-            print("❌ IndexTTS返回空音頻數據")
-            return False
-        
-        print(f"✅ 提示音生成成功，開始播放...")
-        
-        # 同步播放音頻
-        sd.play(wav_data, sampling_rate)
-        sd.wait()  # 等待播放完成
-        print(f"✅ {language} 提示音播放完成")
-        return True
-        
-    except Exception as e:
-        print(f"❌ IndexTTS提示音播放錯誤: {e}")
-        import traceback
-        print(f"詳細錯誤: {traceback.format_exc()}")
-        return False
+    return prompt_thread
 
 def initialize_rag_system():
     """初始化RAG系統"""
@@ -1142,17 +1090,9 @@ def initialize_rag_system():
         print("🚀 開始初始化RAG系統...")
         socketio.emit('system_status', {'status': 'initializing', 'message': '正在初始化RAG系統...'})
         
-        # 導入所需模組
-        from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import (
-            load_documents, split_documents, create_vector_store, 
-            initialize_llm, create_qa_chain, map_whisper_language_to_supported,
-            PDF_DIRECTORY, VECTORSTORE_DIR, ENABLE_TTS_OUTPUT
-        )
-        
         initialization_status = "正在載入文檔..."
         socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
         
-        # 載入文檔
         documents = load_documents(PDF_DIRECTORY)
         if not documents:
             raise Exception("無法載入文檔")
@@ -1160,7 +1100,6 @@ def initialize_rag_system():
         initialization_status = "正在分割文檔..."
         socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
         
-        # 分割文檔
         texts = split_documents(documents)
         if not texts:
             raise Exception("文檔分割失敗")
@@ -1168,7 +1107,6 @@ def initialize_rag_system():
         initialization_status = "正在建立向量儲存..."
         socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
         
-        # 建立向量儲存
         vectorstore = create_vector_store(texts, VECTORSTORE_DIR)
         if not vectorstore:
             raise Exception("向量儲存建立失敗")
@@ -1176,7 +1114,6 @@ def initialize_rag_system():
         initialization_status = "正在初始化LLM..."
         socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
         
-        # 初始化LLM
         llm = initialize_llm()
         if not llm:
             raise Exception("LLM初始化失敗")
@@ -1184,12 +1121,10 @@ def initialize_rag_system():
         initialization_status = "正在建立QA鏈..."
         socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
         
-        # 建立QA鏈
         qa_chain = create_qa_chain(llm, vectorstore, texts)
         if not qa_chain:
             raise Exception("QA鏈建立失敗")
         
-        # 預初始化IndexTTS系統（如果啟用TTS功能）
         if ENABLE_TTS_OUTPUT:
             initialization_status = "正在初始化TTS語音系統..."
             socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
@@ -1201,52 +1136,19 @@ def initialize_rag_system():
             else:
                 print("⚠️ IndexTTS系統預初始化失敗，但不影響文字功能")
         
-        # 預載入Whisper模型（如果啟用語音輸入功能）
         if ENABLE_VOICE_INPUT:
             initialization_status = "正在預載入Whisper語音識別模型..."
             socketio.emit('system_status', {'status': 'initializing', 'message': initialization_status})
             
             print("🎤 開始預載入Whisper模型...")
             try:
-                # 顯示Whisper配置信息
-                from roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI import WHISPER_MODEL_SIZE
-                print(f"📋 Whisper模型配置: {WHISPER_MODEL_SIZE}")
-                print("⏳ 正在載入模型，請稍候...")
-                
                 whisper_loaded = load_whisper_model()
                 if whisper_loaded:
                     print("✅ Whisper模型預載入成功！")
-                    
-                    # 獲取模型信息
-                    try:
-                        import roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI as main_module
-                        if hasattr(main_module, 'whisper_model') and main_module.whisper_model is not None:
-                            model = main_module.whisper_model
-                            print(f"📊 模型詳細信息:")
-                            print(f"   - 模型大小: {WHISPER_MODEL_SIZE}")
-                            print(f"   - 模型類型: {type(model).__name__}")
-                            if hasattr(model, 'device'):
-                                print(f"   - 運行設備: {model.device}")
-                            print("✅ Whisper模型已準備就緒，語音識別功能可用")
-                        else:
-                            print("⚠️ 無法獲取模型詳細信息，但載入成功")
-                    except Exception as info_error:
-                        print(f"⚠️ 獲取模型信息時發生錯誤: {info_error}")
-                        print("✅ 但Whisper模型載入成功")
                 else:
                     print("❌ Whisper模型預載入失敗")
-                    print("⚠️ 語音識別功能將無法使用")
-                    
             except Exception as whisper_error:
                 print(f"❌ Whisper模型預載入時發生錯誤: {whisper_error}")
-                print("⚠️ 語音識別功能可能無法正常使用")
-                import traceback
-                print(f"詳細錯誤: {traceback.format_exc()}")
-        else:
-            print("⚠️ 語音輸入功能已禁用，跳過Whisper模型載入")
-        
-        # 預生成提示音（現在不需要了，因為改為系統播放）
-        pregenerate_prompt_audio()
         
         system_ready = True
         initialization_status = "系統就緒"
@@ -1286,23 +1188,21 @@ def text_question():
         prompt_thread = None
         if ENABLE_PROMPT_AUDIO:
             try:
-                prompt_thread = generate_prompt_audio_async("zh")
+                prompt_thread = generate_prompt_audio_with_avatar_async("zh")
                 print("🎵 提示音開始後台播放，同時開始LLM處理")
             except Exception as prompt_error:
                 print(f"⚠️ 提示音播放失敗: {prompt_error}")
         
-        # 同時開始處理問題（與提示音並行）
         print("🤖 開始LLM處理...")
         result = qa_chain.invoke({"query": question, "language": "zh"})
         answer = result.get('result', '抱歉，無法生成答案。').strip()
         
         print(f"✅ LLM處理完成: {answer[:100]}...")
         
-        # 如果有提示音線程，等待它完成後再播放回答語音
         if prompt_thread is not None:
             try:
                 print("⏳ 等待提示音播放完成...")
-                prompt_thread.join(timeout=10)  # 最多等待10秒
+                prompt_thread.join(timeout=10)
                 if prompt_thread.is_alive():
                     print("⚠️ 提示音播放超時，繼續播放回答語音")
                 else:
@@ -1310,20 +1210,17 @@ def text_question():
             except Exception as e:
                 print(f"⚠️ 等待提示音完成時發生錯誤: {e}")
         
-        # 生成語音回答（系統播放）
         tts_success = False
         if ENABLE_TTS_OUTPUT:
             try:
                 print(f"🔊 開始生成 zh 語音回答...")
-                tts_success = generate_tts_audio(answer, "zh")
+                tts_success = generate_tts_audio_with_avatar(answer, "zh")
                 if tts_success:
                     print("✅ 語音回答播放成功")
                 else:
                     print("❌ 語音回答播放失敗")
             except Exception as tts_error:
                 print(f"❌ TTS處理時發生異常: {tts_error}")
-                import traceback
-                print(f"TTS異常詳情: {traceback.format_exc()}")
         else:
             print("⚠️ TTS功能已禁用，跳過語音生成")
         
@@ -1331,9 +1228,9 @@ def text_question():
             'success': True,
             'question': question,
             'answer': answer,
-            'language': 'zh',  # 文字問題默認為中文
-            'audio_url': None,  # 系統播放，不返回音頻URL
-            'tts_success': tts_success  # 添加TTS成功狀態
+            'language': 'zh',
+            'audio_url': None,
+            'tts_success': tts_success
         })
         
     except Exception as e:
@@ -1358,34 +1255,20 @@ def voice_question():
         if audio_file.filename == '':
             return jsonify({'success': False, 'message': '未選擇文件'})
         
-        # 創建更安全的臨時文件
         import tempfile
         temp_fd, temp_file_path = tempfile.mkstemp(suffix='.wav', prefix='voice_')
         
         try:
-            # 保存音頻文件
             with os.fdopen(temp_fd, 'wb') as temp_file:
                 audio_file.save(temp_file)
             
             print(f"🎤 收到語音文件: {temp_file_path}")
             
-            # 驗證文件是否存在且有內容
-            if not os.path.exists(temp_file_path):
-                raise Exception(f"臨時文件創建失敗: {temp_file_path}")
-            
-            file_size = os.path.getsize(temp_file_path)
-            if file_size == 0:
-                raise Exception("音頻文件為空")
-            
-            print(f"音頻文件大小: {file_size} bytes")
-            
-            # 語音轉文字
             import roboticBar_printChunk_QAsplit_indexTTSclone_JP_UI as main_module
             original_filename = main_module.WAVE_OUTPUT_FILENAME
             main_module.WAVE_OUTPUT_FILENAME = temp_file_path
             
             try:
-                # 確保Whisper模型已載入
                 if not load_whisper_model():
                     raise Exception("Whisper模型載入失敗")
                 
@@ -1400,31 +1283,27 @@ def voice_question():
             
             print(f"🔍 語音識別結果: {question}")
             
-            # 映射語言
             tts_language = map_whisper_language_to_supported(detected_lang)
             print(f"映射後的TTS語言: {tts_language}")
             
-            # 異步播放對應語言的提示音（不阻塞LLM處理）
             prompt_thread = None
             if ENABLE_PROMPT_AUDIO:
                 try:
-                    prompt_thread = generate_prompt_audio_async(tts_language)
+                    prompt_thread = generate_prompt_audio_with_avatar_async(tts_language)
                     print(f"🎵 {tts_language} 提示音開始後台播放，同時開始LLM處理")
                 except Exception as prompt_error:
                     print(f"⚠️ 提示音播放失敗: {prompt_error}")
             
-            # 同時開始處理問題（與提示音並行）
             print("🤖 開始LLM處理...")
             result = qa_chain.invoke({"query": question, "language": tts_language})
             answer = result.get('result', '抱歉，無法生成答案。').strip()
             
             print(f"✅ LLM處理完成: {answer[:100]}...")
             
-            # 如果有提示音線程，等待它完成後再播放回答語音
             if prompt_thread is not None:
                 try:
                     print("⏳ 等待提示音播放完成...")
-                    prompt_thread.join(timeout=10)  # 最多等待10秒
+                    prompt_thread.join(timeout=10)
                     if prompt_thread.is_alive():
                         print("⚠️ 提示音播放超時，繼續播放回答語音")
                     else:
@@ -1432,20 +1311,17 @@ def voice_question():
                 except Exception as e:
                     print(f"⚠️ 等待提示音完成時發生錯誤: {e}")
             
-            # 生成語音回答
             tts_success = False
             if ENABLE_TTS_OUTPUT:
                 try:
                     print(f"🔊 開始生成 {tts_language} 語音回答...")
-                    tts_success = generate_tts_audio(answer, tts_language)
+                    tts_success = generate_tts_audio_with_avatar(answer, tts_language)
                     if tts_success:
                         print(f"✅ {tts_language} 語音回答播放成功")
                     else:
                         print(f"❌ {tts_language} 語音回答播放失敗")
                 except Exception as tts_error:
                     print(f"❌ TTS處理時發生異常: {tts_error}")
-                    import traceback
-                    print(f"TTS異常詳情: {traceback.format_exc()}")
             else:
                 print("⚠️ TTS功能已禁用，跳過語音生成")
             
@@ -1454,8 +1330,8 @@ def voice_question():
                 'question': question,
                 'answer': answer,
                 'language': tts_language,
-                'audio_url': None,  # 系統播放，不返回音頻URL
-                'tts_success': tts_success  # 添加TTS成功狀態
+                'audio_url': None,
+                'tts_success': tts_success
             })
             
         except Exception as inner_error:
@@ -1465,12 +1341,9 @@ def voice_question():
     except Exception as e:
         error_msg = f'處理語音時發生錯誤: {str(e)}'
         print(f"❌ {error_msg}")
-        import traceback
-        print(f"詳細錯誤信息: {traceback.format_exc()}")
         return jsonify({'success': False, 'message': error_msg})
     
     finally:
-        # 清理臨時文件
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)
@@ -1482,6 +1355,12 @@ def voice_question():
 def serve_static_file(filename):
     """提供靜態文件服務"""
     return send_file(os.path.join('static', filename))
+
+# 添加虛擬人物文件服務路由
+@app.route('/static/avatarImage_files/<filename>')
+def serve_avatar_file(filename):
+    """提供虛擬人物文件服務"""
+    return send_file(os.path.join('avatarImage_files', filename))
 
 @socketio.on('connect')
 def handle_connect():
@@ -1499,15 +1378,18 @@ def handle_disconnect():
 
 if __name__ == '__main__':
     print("="*60)
-    print("🌐 RAG聊天機器人 Web UI - 語音版")
+    print("🎭 RAG聊天機器人 Web UI - 虛擬人物版")
     print("="*60)
     print("正在啟動服務器...")
-    print("請在瀏覽器中打開: http://localhost:5002")
+    print("請在瀏覽器中打開: http://localhost:5003")
     print()
     print("功能特色:")
     print("📝 文字問答 - 直接輸入文字問題")
     print("🎤 語音問答 - 點擊按鈕錄音提問")
     print("🔊 語音回答 - 自動播放回答音頻")
+    print("🎭 虛擬人物 - 動態表情和狀態變化")
+    print("💭 思考動畫 - 播放提示音時顯示思考狀態")
+    print("🗣️ 說話動畫 - 播放回答時顯示說話狀態")
     print("💬 聊天記錄 - 保存完整對話歷史")
     print()
     print("系統初始化包含:")
@@ -1516,15 +1398,26 @@ if __name__ == '__main__':
     print("🎤 Whisper語音識別模型預載入")
     print("📚 文檔向量化和索引建立")
     print("⏳ 首次啟動可能需要較長時間，請耐心等待...")
+    print()
+    print("虛擬人物文件需求:")
+    print("📁 ./avatarImage_files/StaticStatus.png - 靜態待命圖片")
+    print("📁 ./avatarImage_files/ThinkingStatus.mp4 - 思考動畫視頻")
+    print("📁 ./avatarImage_files/TalkStatus.mp4 - 說話動畫視頻")
     print("="*60)
     
-    # 創建static目錄（用於存儲臨時音頻文件）
+    # 創建必要目錄
     os.makedirs('static', exist_ok=True)
+    os.makedirs('avatarImage_files', exist_ok=True)
     
     # 在後台線程中初始化RAG系統
     init_thread = threading.Thread(target=initialize_rag_system)
     init_thread.daemon = True
     init_thread.start()
     
-    # 啟動Flask應用
-    socketio.run(app, host='0.0.0.0', port=5002, debug=False) 
+    try:
+        # 啟動Flask應用
+        socketio.run(app, host='0.0.0.0', port=5003, debug=False, log_output=True)
+    except KeyboardInterrupt:
+        print("\n🛑 伺服器已停止")
+    except Exception as e:
+        print(f"\n❌ 伺服器啟動失敗: {e}") 
